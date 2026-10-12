@@ -1,9 +1,9 @@
-from base import SlurmModel
+from base import SlurmModel, configure
+from tracking import wandb_run
 
 
+@configure(framework="ultralytics", data_type="yolo")
 class UltralyticsModel(SlurmModel):
-    config = SlurmModel.config.with_options(framework="ultralytics")
-
     def get_model(self):
         from ultralytics import YOLO
         return YOLO("yolo26n.pt")
@@ -20,5 +20,6 @@ class UltralyticsModel(SlurmModel):
             **self.get_overrides(),
         }
         print(train_args)
-        model = self.get_model()
-        return model.train(**train_args)
+        with wandb_run(config, train_args):
+            model = self.get_model()
+            return model.train(**train_args)

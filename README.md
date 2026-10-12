@@ -45,48 +45,77 @@ names:
 Other YOLO export layouts also work if `data.yaml` points to the right image
 directories. See the [Ultralytics detection dataset format](https://docs.ultralytics.com/datasets/detect/).
 
+Configure the repository import path once, from the repository root:
+
+```bash
+conda env config vars set -n bv_ml PYTHONPATH="$PWD"
+```
+
+If `bv_ml` is already active, deactivate and activate it again to apply this
+setting. Conda automatically exports this path whenever you activate `bv_ml`
+or use `conda run -n bv_ml`, and restores the previous value on deactivation.
+
 Submit the example:
 
 ```bash
 conda activate bv_ml
-python -m models.ultralytics.yolo26s
+python models/ultralytics/yolo26s.py
 ```
 
-The example also supports `python models/ultralytics/yolo26s.py` from the
-repository root. Its direct-script entry point puts the repository root first
-on the import path so the two `base.py` files do not collide. Slurm uses the
-same Python executable, an absolute script path, and the repository working directory.
+The environment's `PYTHONPATH` makes repository imports available without
+import-path setup in model files. Slurm inherits it from the submitting shell
+and runs the absolute model script with the same Python executable from the
+repository directory. If you move the repository, update the environment
+setting to its new location. Module execution such as
+`python -m models.ultralytics.yolo26s` still works.
 
 The inheritance chain is `SlurmModel` → `UltralyticsModel` → `yolo26s`:
 
 - [base.py](base.py) handles Slurm, dataset versions, run counts and directories.
-- [models/ultralytics/base.py](models/ultralytics/base.py) implements model
+- [models/ultralytics/framework.py](models/ultralytics/framework.py) implements model
   construction, shared training defaults, dictionary merging and metadata.
 - [models/ultralytics/yolo26s.py](models/ultralytics/yolo26s.py) selects
   the `yolo26s.pt` weights through its `get_model()` method.
 
-Use `config = Parent.config.with_options(...)` for Slurm and dataset settings.
+Use `@configure(...)` for Slurm and dataset settings on frameworks and models.
 Editors such as VS Code/Pylance can suggest the named fields and check their
-types. Omitted fields retain their inherited values, and each call creates a
-separate config. Mark the child with `@slurmable`.
+types. Omitted fields retain their inherited values, and each configured class
+receives a separate immutable config.
+
+The framework defines shared training behavior and uses `@configure` to specify
+its framework name and expected dataset type. Child models choose weights,
+training overrides, and Slurm resource overrides.
+
+```python
+from base import SlurmModel, configure
+
+
+@configure(framework="ultralytics", data_type="yolo")
+class UltralyticsModel(SlurmModel):
+    # Shared training methods belong here.
+    ...
+```
+
+Mark runnable children with `@slurmable` above `@configure`. Decorators apply
+from the bottom upward, so configuration must finish before `@slurmable`
+launches the model. `@configure` itself never submits a job.
 Save this example as
 `models/ultralytics/my_model.py`:
 
 ```python
-from base import Pitzer, slurmable
-from models.ultralytics.base import UltralyticsModel
+from base import Pitzer, configure, slurmable
+from models.ultralytics.framework import UltralyticsModel
 
 
 @slurmable
+@configure(
+    partition=Pitzer.gpu_exp,
+    gpus_per_node=1,
+    cpus_per_task=8,
+    data_version="v2",
+    time="04:00:00",
+)
 class MyModel(UltralyticsModel):
-    config = UltralyticsModel.config.with_options(
-        partition=Pitzer.gpu_exp,
-        gpus_per_node=1,
-        cpus_per_task=8,
-        data_version="v2",
-        time="04:00:00",
-    )
-
     def get_model(self):
         from ultralytics import YOLO
         return YOLO("yolo26s.pt")
@@ -95,20 +124,20 @@ class MyModel(UltralyticsModel):
         return {"epochs": 150, "batch": 8}
 ```
 
-Submit it with `conda run -n bv_ml --no-capture-output python -m models.ultralytics.my_model`.
+Submit it with `conda run -n bv_ml --no-capture-output python models/ultralytics/my_model.py`.
 The explicit `@slurmable` decorator registers the subclass for Slurm.
 The parent implements training.
 Importing a model module only defines its class; executing the module submits it.
 Add `--train` for direct execution. The subclass inherits the training method.
-Omit the `config` assignment when the inherited Slurm/dataset settings are suitable.
+Omit `@configure` when the inherited Slurm/dataset settings are suitable.
 
 Even `get_overrides()` returning `{}` works with the defaults: `yolo26n.pt`, 100 epochs, image
 size 640, batch size 16, the latest dataset, one GPU and a one-hour time limit.
 Slurm/dataset fields such as `gpus_per_node`, `time`, `data_type` and `data_version`
-belong in `Parent.config.with_options(...)`. Set an explicit CPU allocation with
-`cpus_per_task=8` in that call. `get_overrides()` only supplies model parameters and does not
-modify the SlurmConfig object. `with_options(...)` retains all unspecified
-SlurmConfig fields. Override `get_overrides()` in a child to supply its training
+belong in `@configure(...)`. Set an explicit CPU allocation with
+`cpus_per_task=8` there. `get_overrides()` only supplies model parameters and does not
+modify the config object. Existing `Parent.config.with_options(...)` calls
+continue to work. Override `get_overrides()` in a child to supply its training
 arguments.
 
 Select only a partition: `Pitzer.gpu_exp`, `Ascend.nextgen`, or `Cardinal.gpu`.
@@ -218,10 +247,44 @@ the versioned run directory, with the effective training arguments recorded.
 Run numbers are reserved at submission and reused by the training process.
 Failed or cancelled submissions can leave gaps.
 
+## Weights & Biases
+
+The framework connects through the shared `wandb_run()` helper.
+The W&B project automatically uses the folder name of `config.base_dir`, which
+is the repository directory (`bv_ml` here). No project setting is needed on
+framework or model classes.
+Each framework chooses its integrations in its own `train()` method.
+`UltralyticsModel.train()` calls `wandb_run()`, so all its child models inherit
+that connection. There are no framework or child-level W&B flags.
+Set `WANDB_MODE=online` before submission for cloud syncing or
+`WANDB_MODE=offline` for local logs. The default mode remains disabled.
+Set up the native integration once in `bv_ml`:
+
+```bash
+conda run -n bv_ml --no-capture-output python -m pip install wandb==0.30.0
+conda run -n bv_ml --no-capture-output yolo settings wandb=True
+conda run -n bv_ml --no-capture-output wandb login
+```
+
+Credentials stay in W&B login storage or `WANDB_API_KEY`, never in model files.
+W&B handles authentication and run cleanup; Ultralytics handles metric, plot,
+and best-checkpoint logging. This connection is intended for single-GPU jobs.
+
+`out/ultralytics/yolo26s/v2/` becomes project `bv_ml`, group
+`ultralytics/yolo26s`, and run name `ultralytics/yolo26s/v2`.
+The helper records `framework`, `model`, numeric `run_version`, and the supplied
+training arguments. W&B logs stay under the reserved run directory; it does
+not upload the entire output folder. Each invocation creates a new W&B run ID.
+
+Use standard W&B environment settings for other options: `WANDB_ENTITY` selects
+your team, `WANDB_MODE=offline` saves logs locally for later `wandb sync`, and
+`WANDB_MODE=disabled` disables tracking and native W&B uploads.
+These variables must be present when you submit the Slurm job.
+
 For direct execution on a machine with a GPU available:
 
 ```bash
-conda run -n bv_ml --no-capture-output python -m models.ultralytics.yolo26s --train
+conda run -n bv_ml --no-capture-output python models/ultralytics/yolo26s.py --train
 ```
 
 To use CPU training, set `gpus_per_node=0` in `replace(Parent.config, ...)` before direct execution.

@@ -8,11 +8,19 @@ import shlex
 import subprocess
 import sys
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Unpack
-from slurm_options import Ascend, Cardinal, Partition, Pitzer, SlurmConfigOptions
+from typing import Any, TypeVar, Unpack
 
+# Partition enums are also public imports from this module.
+from slurm_options import (  # noqa: F401
+    Ascend,
+    Cardinal,
+    Partition,
+    Pitzer,
+    SlurmConfigOptions,
+)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -35,19 +43,23 @@ class Config:
     _run: int | None = None
 
     @property
+    def base_dir(self) -> Path:
+        return ROOT
+
+    @property
     def cpus(self):
         return self._cpus if self._cpus is not None else max(1, self.gpus * 8)
 
-    def with_options(self, **options: Unpack[SlurmConfigOptions]):
+    def with_options(self, **options: Unpack[SlurmConfigOptions]) -> "Config":
         """Return an independent config, accepting existing model option names."""
         aliases = {
             "gpus_per_node": "gpus",
             "cpus_per_task": "_cpus",
             "time": "time_limit",
         }
-        changes = {aliases.get(key, key): value for key, value in options.items()}
-        if "partition" in changes:
-            changes["cluster"] = changes["partition"].cluster
+        changes: dict[str, Any] = {aliases.get(key, key): value for key, value in options.items()}
+        if "partition" in options:
+            changes["cluster"] = options["partition"].cluster
         return replace(self, **changes)
 
     @property
@@ -137,6 +149,7 @@ class SlurmJob(ABC):
             input=script,
             text=True,
             capture_output=True,
+            check=False,
         )
         if result.returncode != 0:
             raise RuntimeError(f"sbatch failed:\n{result.stderr.strip()}")
@@ -163,8 +176,55 @@ class SlurmJob(ABC):
 # Existing model subclasses use this name for the shared Slurm parent.
 SlurmModel = SlurmJob
 
+_ModelType = TypeVar("_ModelType", bound=SlurmJob)
 
-def slurmable(cls):
+
+def configure(**options: Unpack[SlurmConfigOptions]) -> Callable[[type[_ModelType]], type[_ModelType]]:
+    """Override inherited Slurm and dataset settings without launching the class.
+
+    Every parameter is optional. Omitted parameters retain the parent class's
+    values. Supplied values, including None, replace those inherited values.
+    Put @configure below @slurmable so settings apply before launch.
+
+    Args:
+        account (str): Slurm billing account, for example "PAS3560".
+        partition (Partition): GPU-capable partition enum, such as
+            Pitzer.gpu_exp or Ascend.nextgen. Also selects the target cluster.
+        gpus_per_node (int): GPUs requested per node. Zero omits the GPU request.
+        time (str): Wall-time limit, such as "04:00:00" or "2-00:00:00".
+        cpus_per_task (int | None): CPU cores per task. None restores automatic
+            allocation: max(1, gpus_per_node * 8).
+        framework (str): Framework directory under out/, such as "ultralytics".
+            Normally declared by the framework class.
+        job_name (str): Slurm job name. @slurmable replaces this with the
+            concrete model class name.
+        nodes (int): Number of compute nodes requested.
+        ntasks (int): Total number of Slurm tasks requested.
+        data_type (str): Dataset format subdirectory, such as "yolo" or
+            "classification". Normally declared by the framework class.
+        data_version (str): Dataset version directory, such as "v2".
+            "latest" selects the highest numeric version when data is resolved.
+        data_file (str | None): Dataset file within the format directory,
+            such as "data.yaml". None passes the directory itself to training.
+
+    Returns:
+        A decorator that assigns an independent config and returns the
+        original class. The parent class's config remains unchanged.
+
+    Example:
+        @slurmable
+        @configure(partition=Ascend.nextgen, time="04:00:00", data_version="v2")
+        class MyModel(UltralyticsModel):
+            ...
+    """
+    def apply(cls: type[_ModelType]) -> type[_ModelType]:
+        cls.config = cls.config.with_options(**options)
+        return cls
+
+    return apply
+
+
+def slurmable(cls: type[_ModelType]) -> type[_ModelType]:
     cls.config = replace(cls.config, job_name=cls.__name__)
     if cls.__module__ == "__main__":
         cls.launch()

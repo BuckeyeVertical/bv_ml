@@ -130,3 +130,4 @@ dependencies:
       - ultralytics-platform==0.1.83
       - ultralytics-thop==2.2.2
       - urllib3==2.8.0
+      - wandb==0.30.0
