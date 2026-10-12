@@ -1,5 +1,6 @@
-"""OSC partition documentation for editor completion and hover hints.
+"""GPU-capable OSC partitions for editor completion and hover hints.
 
+CPU-only partitions and partitions without configured GPU nodes are omitted.
 VRAM below is per GPU, not host RAM or the sum across GPUs in a node.
 Partition hardware was checked with sinfo on 2026-10-10. GPU capacities:
 https://www.osc.edu/resources/technical_support/supercomputers/pitzer/batch_limit_rules
@@ -24,20 +25,10 @@ class _ClusterPartition(StrEnum):
 
 
 class Pitzer(_ClusterPartition):
-    """Pitzer partitions; NVIDIA V100 GPUs have 16 or 32 GB VRAM each."""
+    """GPU-capable Pitzer partitions; V100 GPUs have 16 or 32 GB VRAM each."""
 
     batch = "batch"
     """Mixed CPU/GPU pool; V100 GPUs have 16 or 32 GB VRAM per GPU."""
-    cpu = "cpu"
-    """CPU-only partition; no GPUs or GPU VRAM."""
-    cpu_exp = "cpu-exp"
-    """CPU-only expansion partition; no GPUs or GPU VRAM."""
-    debug = "debug"
-    """CPU debug pool; no GPUs currently configured. Use gpudebug for GPUs."""
-    debug_cpu = "debug-cpu"
-    """CPU-only debug partition; no GPUs or GPU VRAM."""
-    debug_exp = "debug-exp"
-    """CPU-only expansion debug partition; no GPUs or GPU VRAM."""
     gpu = "gpu"
     """NVIDIA V100: 16 GB VRAM per GPU; 2 GPUs per node."""
     gpu_exp = "gpu-exp"
@@ -56,22 +47,8 @@ class Pitzer(_ClusterPartition):
     """Expansion debug NVIDIA V100: 32 GB VRAM per GPU; 2 GPUs per node."""
     gpudebug_quad = "gpudebug-quad"
     """Quad debug NVIDIA V100: 32 GB VRAM per GPU; 4 GPUs per node."""
-    hugemem = "hugemem"
-    """CPU-only huge host-memory partition; no GPUs or GPU VRAM."""
-    largemem = "largemem"
-    """CPU-only large host-memory partition; no GPUs or GPU VRAM."""
-    longcpu = "longcpu"
-    """CPU-only long-running partition; no GPUs or GPU VRAM."""
     systems = "systems"
     """Systems pool with CPU/GPU nodes; V100 VRAM is 16 or 32 GB per GPU."""
-    condo_anzenbacher_olivucci = "condo-anzenbacher-olivucci"
-    """CPU-only condo partition; no GPUs currently configured."""
-    condo_anzenbacher_olivucci_backfill = "condo-anzenbacher-olivucci-backfill"
-    """CPU-only condo backfill partition; no GPUs currently configured."""
-    condo_peterson_olivucci = "condo-peterson-olivucci"
-    """CPU-only condo partition; no GPUs currently configured."""
-    condo_peterson_olivucci_backfill = "condo-peterson-olivucci-backfill"
-    """CPU-only condo backfill partition; no GPUs currently configured."""
 
     @property
     def cluster(self) -> Cluster:
@@ -79,20 +56,16 @@ class Pitzer(_ClusterPartition):
 
 
 class Ascend(_ClusterPartition):
-    """Ascend partitions; NVIDIA A100 GPUs have 40 or 80 GB VRAM each."""
+    """GPU-capable Ascend partitions; A100 GPUs have 40 or 80 GB VRAM each."""
 
     batch = "batch"
     """Mixed A100 pool: 40 or 80 GB VRAM per GPU, depending on node type."""
-    cpuonly = "cpuonly"
-    """CPU-only partition; GPUs are not exposed and no GPU VRAM is available."""
     debug = "debug"
     """Mixed A100 debug pool: 40 or 80 GB VRAM per GPU."""
     debug_nextgen = "debug-nextgen"
     """Nextgen debug NVIDIA A100: 40 GB VRAM per GPU; 2 or 3 GPUs per node."""
     debug_quad = "debug-quad"
     """Quad debug NVIDIA A100: 80 GB VRAM per GPU; 4 GPUs per node."""
-    gpu = "gpu"
-    """No nodes currently configured; no available GPU VRAM. Use nextgen or quad."""
     longgpu = "longgpu"
     """Long-running NVIDIA A100: 40 GB VRAM per GPU; 2 or 3 GPUs per node."""
     nextgen = "nextgen"
@@ -114,7 +87,7 @@ class Ascend(_ClusterPartition):
 
 
 class Cardinal(_ClusterPartition):
-    """Cardinal partitions; NVIDIA H100 GPUs have 94 GB VRAM each.
+    """GPU-capable Cardinal partitions; H100 GPUs have 94 GB VRAM each.
 
     OSC's cluster overview lists 94 GB per GPU; its technical specifications
     page lists 96 GB. These hints use the lower overview figure for planning:
@@ -123,24 +96,12 @@ class Cardinal(_ClusterPartition):
 
     batch = "batch"
     """Mixed CPU/GPU pool; NVIDIA H100 GPUs have 94 GB VRAM per GPU."""
-    cache = "cache"
-    """CPU-only HBM cache partition; host HBM is not GPU VRAM. No GPUs."""
-    cpu = "cpu"
-    """CPU-only partition; host HBM is not GPU VRAM. No GPUs."""
     debug = "debug"
     """Mixed CPU/GPU debug pool; NVIDIA H100 GPUs have 94 GB VRAM per GPU."""
     gpu = "gpu"
     """NVIDIA H100: 94 GB VRAM per GPU; 4 GPUs per node with NVLink."""
-    hugemem = "hugemem"
-    """CPU-only huge host-memory partition; no GPUs or GPU VRAM."""
-    longcpu = "longcpu"
-    """CPU-only long-running partition; no GPUs or GPU VRAM."""
     systems = "systems"
     """Systems CPU/GPU pool; NVIDIA H100 GPUs have 94 GB VRAM per GPU."""
-    condo_ccapp = "condo-ccapp"
-    """CPU-only condo partition; no GPUs currently configured."""
-    condo_ccapp_backfill = "condo-ccapp-backfill"
-    """CPU-only condo backfill partition; no GPUs currently configured."""
     condo_haiphan = "condo-haiphan"
     """Condo NVIDIA H100: 94 GB VRAM per GPU; 4 GPUs per node."""
     condo_pingzhang = "condo-pingzhang"
@@ -158,7 +119,7 @@ class SlurmConfigOptions(TypedDict, total=False):
     account: str
     """Slurm billing account, such as PAS3560."""
     partition: Partition
-    """Select a partition, such as Ascend.nextgen; its cluster is automatic."""
+    """Select a GPU-capable partition, such as Ascend.nextgen; cluster is automatic."""
     gpus_per_node: int
     """Number of GPUs per node; zero requests a CPU job."""
     time: str
