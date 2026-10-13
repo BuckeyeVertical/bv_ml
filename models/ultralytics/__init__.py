@@ -1,1 +1,1 @@
-"""Reusable Ultralytics training jobs and model-specific subclasses."""
+"""Models trained with Ultralytics."""

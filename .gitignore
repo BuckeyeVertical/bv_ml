@@ -220,6 +220,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 # bv_ml generated state
+/.modelcache/
 /.venv/
 /out/
 /datasets/

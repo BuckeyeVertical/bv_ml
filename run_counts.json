@@ -1,4 +1,6 @@
 {
   "YOLO26": 3,
-  "yolo26s": 3
+  "yolo26s": 3,
+  "Ultralytics/YOLO26/large": 1,
+  "ultralytics/yolo26/small": 1
 }

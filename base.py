@@ -1,4 +1,3 @@
-"""Shared configuration and Slurm entry points for training models."""
 import argparse
 import fcntl
 import inspect
@@ -8,85 +7,95 @@ import shlex
 import subprocess
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TypeVar, Unpack
-
-# Partition enums are also public imports from this module.
-from slurm_options import (  # noqa: F401
-    Ascend,
-    Cardinal,
-    Partition,
-    Pitzer,
-    SlurmConfigOptions,
-)
 
 ROOT = Path(__file__).resolve().parent
 
 
-@dataclass(frozen=True)
-class Config:
-    account: str = "PAS3560"
-    cluster: str = "pitzer"
-    partition: Partition = Pitzer.gpu_exp
-    gpus: int = 1
-    time_limit: str = "01:00:00"
-    _cpus: int | None = None
-    framework: str = "models"
-    job_name: str = "model"
-    data_type: str = "yolo"
-    data_version: str = "latest"
-    data_file: str | None = "data.yaml"
-    nodes: int = 1
-    ntasks: int = 1
-    _run: int | None = None
+@dataclass
+class SlurmConfig:
+    _slurm: dict[str, object] = field(default_factory=lambda: {
+        "account": "PAS3560",
+        "clusters": "pitzer",
+        "partition": "gpu-exp",
+        "gpus-per-node": 1,
+        "cpus-per-task": 8,
+        "time": "01:00:00",
+        "nodes": 1,
+        "ntasks": 1,
+    }, repr=False)
+
+    def __post_init__(self):
+        self._slurm = self._slurm.copy()
 
     @property
-    def base_dir(self) -> Path:
-        return ROOT
+    def slurm(self):
+        return self._slurm
 
-    @property
-    def cpus(self):
-        return self._cpus if self._cpus is not None else max(1, self.gpus * 8)
+    @slurm.setter
+    def slurm(self, updates):
+        self._slurm = {**self._slurm, **updates}
 
-    def with_options(self, **options: Unpack[SlurmConfigOptions]) -> "Config":
-        """Return an independent config, accepting existing model option names."""
-        aliases = {
-            "gpus_per_node": "gpus",
-            "cpus_per_task": "_cpus",
-            "time": "time_limit",
+    def with_options(self, *, slurm={}):
+        config = replace(self)
+        config.slurm = slurm
+        return config
+
+
+class BaseModel(ABC):
+    config = SlurmConfig()
+    data_version: int = 1
+    model_cache_dir: Path = ROOT / ".modelcache"
+    model_path: Path = Path()
+    _run_number: int | None = None
+    _run_timestamp: str | None = None
+    _resolved_data_version: int | None = None
+
+    @classmethod
+    def _data_directories(cls):
+        return {
+            int(directory.name.split(".", 1)[0][1:]): directory
+            for directory in (ROOT / "data").glob("v*")
+            if directory.is_dir()
         }
-        changes: dict[str, Any] = {aliases.get(key, key): value for key, value in options.items()}
-        if "partition" in options:
-            changes["cluster"] = options["partition"].cluster
-        return replace(self, **changes)
 
     @property
-    def data(self):
-        data_root = ROOT / "data"
-        version = self.data_version
-        if version == "latest":
-            candidates = []
-            for directory in data_root.iterdir():
-                match = re.fullmatch(r"v(\d+)(?:\..+)?", directory.name)
-                if directory.is_dir() and match:
-                    candidates.append((int(match.group(1)), directory.name))
-            if not candidates:
-                raise FileNotFoundError(f"No versioned datasets in {data_root}")
-            version = max(candidates)[1]
-        path = data_root / version / self.data_type
-        return str(path / self.data_file if self.data_file else path)
+    def data_dir(self):
+        version = self._resolved_data_version if self._resolved_data_version is not None else self.data_version
+        if type(version) is not int:
+            raise TypeError("data_version must be an integer")
+        versions = self._data_directories()
+        version = max(versions, default=-1) if version == -1 else version
+        return versions[version]
+
+    @classmethod
+    def get_out_dir(cls):
+        if cls._run_number is None or cls._run_timestamp is None or cls._resolved_data_version is None:
+            raise RuntimeError("A run must be reserved before training")
+        timestamp = datetime.strptime(cls._run_timestamp, "%Y%m%dT%H%M%S%fZ").strftime("%m-%d-%H:%M-%y")
+        return ROOT / "out" / cls.model_path / f"v{cls._run_number}.dv{cls._resolved_data_version}.{timestamp}"
 
     @property
     def out_dir(self):
-        if self._run is None:
-            raise RuntimeError("A run must be reserved before training")
-        return ROOT / "out" / self.framework / self.job_name / f"v{self._run}"
+        return type(self).get_out_dir()
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        model_path = Path(inspect.getfile(cls)).resolve().relative_to(ROOT)
+        if model_path.parts[0] == "models":
+            model_path = Path(*model_path.parts[1:])
+        cls.config = cls.config.with_options()
+        cls.model_path = model_path.with_suffix("")
+        cls._run_number = None
+        cls._run_timestamp = None
+        cls._resolved_data_version = None
+        train = cls.__dict__.get("train")
+        if train is not None and not getattr(train, "__isabstractmethod__", False):
+            from tracking import tracked_train
 
-class SlurmJob(ABC):
-    config = Config()
+            cls.train = tracked_train(train)
 
     @abstractmethod
     def train(self):
@@ -101,10 +110,12 @@ class SlurmJob(ABC):
             help=argparse.SUPPRESS,
         )
         parser.add_argument("--run", type=int, help=argparse.SUPPRESS)
+        parser.add_argument("--timestamp", help=argparse.SUPPRESS)
+        parser.add_argument("--data-version", type=int, help=argparse.SUPPRESS)
         args = parser.parse_args()
 
         if args.train:
-            cls.prepare_run(args.run)
+            cls.prepare_run(args.run, args.timestamp, args.data_version)
             cls().train()
         else:
             cls.submit()
@@ -112,8 +123,6 @@ class SlurmJob(ABC):
     @classmethod
     def submit(cls) -> None:
         cls.prepare_run()
-        settings = cls.config
-
         script_path = Path(inspect.getfile(cls)).resolve()
         run_command = shlex.join([
             "srun",
@@ -121,31 +130,36 @@ class SlurmJob(ABC):
             str(script_path),
             "--train",
             "--run",
-            str(settings._run),
+            str(cls._run_number),
+            "--timestamp",
+            cls._run_timestamp,
+            "--data-version",
+            str(cls._resolved_data_version),
         ])
 
-        lines = [
-            "#!/bin/bash",
-            f"#SBATCH --job-name={cls.__name__.lower()}",
-            f"#SBATCH --nodes={settings.nodes}",
-            f"#SBATCH --ntasks={settings.ntasks}",
-            f"#SBATCH --cpus-per-task={settings.cpus}",
-            f"#SBATCH --time={settings.time_limit}",
-            f"#SBATCH --output={settings.out_dir / 'logs' / 'slurm-%j.out'}",
-            f"#SBATCH --partition={settings.partition}",
-            f"#SBATCH --account={settings.account}",
-        ]
-        if settings.gpus:
-            lines.append(f"#SBATCH --gpus-per-node={settings.gpus}")
+        directives = cls.config.slurm.copy()
+        directives.setdefault("job-name", cls.model_path.name.lower())
+        directives.setdefault("output", cls.get_out_dir() / "logs" / "slurm-%j.out")
+        directives.setdefault("chdir", ROOT)
+
+        lines = ["#!/bin/bash"]
+        for key, value in directives.items():
+            if value is None or value is False:
+                continue
+            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", key):
+                raise ValueError(f"Use a Slurm option name without leading dashes: {key!r}")
+            if value is True:
+                lines.append(f"#SBATCH --{key}")
+            else:
+                value = str(value)
+                if "\n" in value or "\r" in value:
+                    raise ValueError(f"Slurm option {key!r} must have a single-line value")
+                lines.append(f"#SBATCH --{key}={shlex.quote(value)}")
 
         script = "\n".join([*lines, "", run_command, ""])
 
-        sbatch_command = ["sbatch", f"--chdir={ROOT}"]
-        if settings.cluster:
-            sbatch_command.append(f"--clusters={settings.cluster}")
-
         result = subprocess.run(
-            sbatch_command,
+            ["sbatch"],
             input=script,
             text=True,
             capture_output=True,
@@ -157,76 +171,55 @@ class SlurmJob(ABC):
         print(result.stdout.strip())
 
     @classmethod
-    def prepare_run(cls, run=None):
+    def prepare_run(cls, run=None, timestamp=None, data_version=None):
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        elif not re.fullmatch(r"\d{8}T\d{12}Z", timestamp):
+            raise ValueError("Run timestamp must have the UTC format YYYYMMDDTHHMMSSffffffZ")
+        data_version = cls.data_version if data_version is None else data_version
+        if type(data_version) is not int:
+            raise TypeError("data_version must be an integer")
+        if data_version == -1:
+            versions = cls._data_directories()
+            if not versions:
+                raise KeyError(-1)
+            data_version = max(versions)
         if run is None:
             with (ROOT / "run_counts.json").open("a+") as handle:
                 fcntl.flock(handle, fcntl.LOCK_EX)
                 handle.seek(0)
                 counts = json.loads(handle.read() or "{}")
-                run = counts.get(cls.config.job_name, 0) + 1
-                counts[cls.config.job_name] = run
+                model_key = cls.model_path.as_posix()
+                legacy_run_number = max(
+                    (value for key, value in counts.items() if key.casefold() == cls.__name__.casefold()),
+                    default=0,
+                )
+                previous_run_number = max(
+                    (value for key, value in counts.items() if key.casefold() == model_key.casefold()),
+                    default=legacy_run_number,
+                )
+                run = previous_run_number + 1
+                counts[model_key] = run
                 handle.seek(0)
                 handle.truncate()
                 json.dump(counts, handle, indent=2)
                 handle.write("\n")
-        cls.config = replace(cls.config, _run=run)
-        (cls.config.out_dir / "logs").mkdir(parents=True, exist_ok=True)
+        cls._run_number = run
+        cls._run_timestamp = timestamp
+        cls._resolved_data_version = data_version
+        (cls.get_out_dir() / "logs").mkdir(parents=True, exist_ok=True)
 
 
-# Existing model subclasses use this name for the shared Slurm parent.
-SlurmModel = SlurmJob
-
-_ModelType = TypeVar("_ModelType", bound=SlurmJob)
-
-
-def configure(**options: Unpack[SlurmConfigOptions]) -> Callable[[type[_ModelType]], type[_ModelType]]:
-    """Override inherited Slurm and dataset settings without launching the class.
-
-    Every parameter is optional. Omitted parameters retain the parent class's
-    values. Supplied values, including None, replace those inherited values.
-    Put @configure below @slurmable so settings apply before launch.
-
-    Args:
-        account (str): Slurm billing account, for example "PAS3560".
-        partition (Partition): GPU-capable partition enum, such as
-            Pitzer.gpu_exp or Ascend.nextgen. Also selects the target cluster.
-        gpus_per_node (int): GPUs requested per node. Zero omits the GPU request.
-        time (str): Wall-time limit, such as "04:00:00" or "2-00:00:00".
-        cpus_per_task (int | None): CPU cores per task. None restores automatic
-            allocation: max(1, gpus_per_node * 8).
-        framework (str): Framework directory under out/, such as "ultralytics".
-            Normally declared by the framework class.
-        job_name (str): Slurm job name. @slurmable replaces this with the
-            concrete model class name.
-        nodes (int): Number of compute nodes requested.
-        ntasks (int): Total number of Slurm tasks requested.
-        data_type (str): Dataset format subdirectory, such as "yolo" or
-            "classification". Normally declared by the framework class.
-        data_version (str): Dataset version directory, such as "v2".
-            "latest" selects the highest numeric version when data is resolved.
-        data_file (str | None): Dataset file within the format directory,
-            such as "data.yaml". None passes the directory itself to training.
-
-    Returns:
-        A decorator that assigns an independent config and returns the
-        original class. The parent class's config remains unchanged.
-
-    Example:
-        @slurmable
-        @configure(partition=Ascend.nextgen, time="04:00:00", data_version="v2")
-        class MyModel(UltralyticsModel):
-            ...
-    """
-    def apply(cls: type[_ModelType]) -> type[_ModelType]:
-        cls.config = cls.config.with_options(**options)
+def configure(*, slurm={}):
+    """Merge Slurm overrides into a model's independent configuration."""
+    def apply(cls):
+        cls.config = cls.config.with_options(slurm=slurm)
         return cls
 
     return apply
 
 
-def slurmable(cls: type[_ModelType]) -> type[_ModelType]:
-    cls.config = replace(cls.config, job_name=cls.__name__)
+def slurmable(cls):
     if cls.__module__ == "__main__":
         cls.launch()
-
     return cls
