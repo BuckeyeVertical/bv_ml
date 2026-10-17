@@ -1,25 +1,24 @@
-from base import BaseModel, configure, slurmable
+from base import slurmable
 
 
-@slurmable
-@configure(slurm={
-    "clusters": "pitzer",
-    "partition": "gpu-exp",
-    "gpus-per-node": 1,
-    "cpus-per-task": 12,
-    "time": "1-00:00:00",
-})
-class Medium(BaseModel):
-    def train(self):
-        from ultralytics import YOLO
+@slurmable(
+    DATA_VERSION=1,
+    clusters="pitzer",
+    partition="gpu-exp",
+    gpus_per_node=1,
+    cpus_per_task=12,
+    time="01:00:00",
+)
+def train(config):
+    from ultralytics import YOLO
 
-        return YOLO(str(self.model_cache_dir / "yolo26m.pt")).train(
-            data=str(self.data_dir / "yolo" / "data.yaml"),
-            save_dir=self.out_dir,
-            epochs=100,
-            imgsz=640,
-            batch=8,
-            amp=True,
-            cache=False,
-            workers=self.config.slurm["cpus-per-task"] // 4,
-        )
+    return YOLO(str(config.model_cache_dir / "yolo26m.pt")).train(
+        data=str(config.data_dir / "yolo" / "data.yaml"),
+        save_dir=config.out_dir,
+        epochs=100,
+        imgsz=640,
+        batch=8,
+        amp=True,
+        cache=False,
+        workers=config.slurm["cpus-per-task"] // 4,
+    )
