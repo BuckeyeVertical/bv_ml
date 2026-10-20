@@ -1,225 +1,316 @@
 import argparse
-import fcntl
 import inspect
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
+from typing import TypeVar, overload
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent
+SEASON = "2026-2027"
+
+_DEFAULT_SLURM = {
+    "account": "PAS3560",
+    "clusters": "pitzer",
+    "partition": "gpu-exp",
+    "gpus-per-node": 1,
+    "cpus-per-task": 8,
+    "time": "01:00:00",
+    "nodes": 1,
+    "ntasks": 1,
+}
+
+_Result = TypeVar("_Result")
 
 
-@dataclass
-class SlurmConfig:
-    _slurm: dict[str, object] = field(default_factory=lambda: {
-        "account": "PAS3560",
-        "clusters": "pitzer",
-        "partition": "gpu-exp",
-        "gpus-per-node": 1,
-        "cpus-per-task": 8,
-        "time": "01:00:00",
-        "nodes": 1,
-        "ntasks": 1,
-    }, repr=False)
+@dataclass(frozen=True)
+class WandbConfig:
+    """Framework-independent settings for the W&B run owned by the wrapper."""
 
-    def __post_init__(self):
-        self._slurm = self._slurm.copy()
-
-    @property
-    def slurm(self):
-        return self._slurm
-
-    @slurm.setter
-    def slurm(self, updates):
-        self._slurm = {**self._slurm, **updates}
-
-    def with_options(self, *, slurm={}):
-        config = replace(self)
-        config.slurm = slurm
-        return config
+    entity: str
+    project: str
+    group: str
+    name: str
+    id: str
+    dir: str
+    mode: str = "online"
 
 
-class BaseModel(ABC):
-    config = SlurmConfig()
-    data_version: int = 1
-    model_cache_dir: Path = ROOT / ".modelcache"
-    model_path: Path = Path()
-    _run_number: int | None = None
-    _run_timestamp: str | None = None
-    _resolved_data_version: int | None = None
+@dataclass(frozen=True)
+class Run:
+    """Paths, resources, and reserved metadata for one training invocation."""
 
-    @classmethod
-    def _data_directories(cls):
-        return {
-            int(directory.name.split(".", 1)[0][1:]): directory
-            for directory in (ROOT / "data").glob("v*")
-            if directory.is_dir()
-        }
+    data_dir: Path
+    out_dir: Path
+    model_cache_dir: Path
+    slurm: dict[str, object]
+    model_path: Path
+    run_id: str
+    run_timestamp: str
+    data_version: int
+    season: str = SEASON
 
     @property
-    def data_dir(self):
-        version = self._resolved_data_version if self._resolved_data_version is not None else self.data_version
-        if type(version) is not int:
-            raise TypeError("data_version must be an integer")
-        versions = self._data_directories()
-        version = max(versions, default=-1) if version == -1 else version
-        return versions[version]
-
-    @classmethod
-    def get_out_dir(cls):
-        if cls._run_number is None or cls._run_timestamp is None or cls._resolved_data_version is None:
-            raise RuntimeError("A run must be reserved before training")
-        timestamp = datetime.strptime(cls._run_timestamp, "%Y%m%dT%H%M%S%fZ").strftime("%m-%d-%H:%M-%y")
-        return ROOT / "out" / cls.model_path / f"v{cls._run_number}.dv{cls._resolved_data_version}.{timestamp}"
+    def train_out_dir(self) -> Path:
+        """Training output directory that frameworks can recreate safely."""
+        return self.out_dir / "train"
 
     @property
-    def out_dir(self):
-        return type(self).get_out_dir()
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        model_path = Path(inspect.getfile(cls)).resolve().relative_to(ROOT)
-        if model_path.parts[0] == "models":
-            model_path = Path(*model_path.parts[1:])
-        cls.config = cls.config.with_options()
-        cls.model_path = model_path.with_suffix("")
-        cls._run_number = None
-        cls._run_timestamp = None
-        cls._resolved_data_version = None
-        train = cls.__dict__.get("train")
-        if train is not None and not getattr(train, "__isabstractmethod__", False):
-            from tracking import tracked_train
-
-            cls.train = tracked_train(train)
-
-    @abstractmethod
-    def train(self):
-        pass
-
-    @classmethod
-    def launch(cls):
-        parser = argparse.ArgumentParser()
-        parser.add_argument(
-            "--train",
-            action="store_true",
-            help=argparse.SUPPRESS,
+    def wandb(self) -> WandbConfig:
+        """W&B settings available to training code before logging starts."""
+        return WandbConfig(
+            entity="BuckeyeVertical",
+            project=f"season-{self.season}",
+            group=self.model_path.as_posix(),
+            name=self.out_dir.name,
+            id=self.run_id,
+            dir=str(self.out_dir),
         )
-        parser.add_argument("--run", type=int, help=argparse.SUPPRESS)
-        parser.add_argument("--timestamp", help=argparse.SUPPRESS)
-        parser.add_argument("--data-version", type=int, help=argparse.SUPPRESS)
-        args = parser.parse_args()
 
-        if args.train:
-            cls.prepare_run(args.run, args.timestamp, args.data_version)
-            cls().train()
+
+def _reserve_run(
+    script_path: Path,
+    slurm: dict[str, object],
+    data_version: int,
+    *,
+    run_timestamp: str | None = None,
+    season: str = SEASON,
+) -> Run:
+    reserved = run_timestamp is not None
+    if not re.fullmatch(r"\d{4}-\d{4}", season) or int(season[5:]) != int(season[:4]) + 1:
+        raise ValueError("Season must name consecutive years, such as 2026-2027")
+    if run_timestamp is None:
+        run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    elif not re.fullmatch(r"\d{8}T\d{12}Z", run_timestamp):
+        raise ValueError("Run timestamp must have the UTC format YYYYMMDDTHHMMSSffffffZ")
+    timestamp = datetime.strptime(run_timestamp, "%Y%m%dT%H%M%S%f%z")
+
+    if type(data_version) is not int:
+        raise TypeError("data_version must be an integer")
+    versions = {
+        int(directory.name.split(".", 1)[0][1:]): directory
+        for directory in (ROOT / "data").glob("v*")
+        if directory.is_dir()
+    }
+    if data_version == -1:
+        data_version = max(versions, default=-1)
+    data_dir = versions[data_version]
+
+    model_path = script_path.relative_to(ROOT)
+    if model_path.parts[0] == "models":
+        model_path = Path(*model_path.parts[1:])
+    model_path = model_path.with_suffix("")
+    out_dir = ROOT / "out" / season / model_path / f"{model_path.name}.{timestamp:%y-%m-%d-%H%M%S}.dv{data_version:03d}"
+    metadata = {
+        "season": season,
+        "model_path": model_path.as_posix(),
+        "run_timestamp": run_timestamp,
+        "data_version": data_version,
+    }
+    if reserved:
+        saved = json.loads((out_dir / "run.json").read_text())
+        if not isinstance(saved, dict) or any(saved.get(key) != value for key, value in metadata.items()):
+            raise ValueError(f"Reserved run metadata does not match: {out_dir}")
+        run_id = saved.get("run_id")
+        if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{32}", run_id):
+            raise ValueError(f"Reserved run has an invalid W&B run ID: {out_dir}")
+    else:
+        try:
+            out_dir.mkdir(parents=True)
+        except FileExistsError as error:
+            raise FileExistsError(f"Run output already exists: {out_dir}. Retry after the current second.") from error
+        run_id = uuid4().hex
+        (out_dir / "run.json").write_text(json.dumps({**metadata, "run_id": run_id}, indent=2) + "\n")
+    (out_dir / "logs").mkdir(parents=True, exist_ok=True)
+    return Run(
+        data_dir=data_dir,
+        out_dir=out_dir,
+        model_cache_dir=ROOT / ".modelcache",
+        slurm=slurm.copy(),
+        model_path=model_path,
+        run_id=run_id,
+        run_timestamp=run_timestamp,
+        data_version=data_version,
+        season=season,
+    )
+
+
+def _execute(train: Callable[[Run], _Result], config: Run) -> _Result:
+    staged_dir = os.environ.get("BV_ML_DATA_DIR")
+    if staged_dir:
+        data_dir = Path(staged_dir).resolve(strict=True)
+        if not data_dir.is_dir() or data_dir.name != config.data_dir.name:
+            raise ValueError(f"Staged dataset must be a directory named {config.data_dir.name}: {data_dir}")
+        config = replace(config, data_dir=data_dir)
+
+    import wandb
+
+    print(config)
+    with wandb.init(
+        **asdict(config.wandb),
+        config={
+            "model_path": config.model_path.as_posix(),
+            "model": config.model_path.name,
+            "run_id": config.run_id,
+            "run_timestamp": config.run_timestamp,
+            "data_version": config.data_version,
+            "season": config.season,
+        },
+    ):
+        return train(config)
+
+
+def _submit(script_path: Path, run: Run) -> None:
+    if str(run.slurm.get("nodes") or 1) != "1":
+        raise ValueError("Dataset staging currently supports single-node jobs only")
+    archive = ROOT / "data" / "archives" / f"{run.data_dir.name}.tar"
+    if not archive.is_file():
+        command = shlex.join([sys.executable, str(ROOT / "prepare_datasets.py")])
+        raise FileNotFoundError(f"Dataset archive not found: {archive}. Submit CPU dataset preparation with: {command}")
+
+    run_command = shlex.join([
+        "srun",
+        f"--cpus-per-task={run.slurm.get('cpus-per-task') or 1}",
+        sys.executable,
+        str(script_path),
+        "--train",
+        "--timestamp",
+        run.run_timestamp,
+        "--season",
+        run.season,
+        "--data-version",
+        str(run.data_version),
+    ])
+    directives = run.slurm.copy()
+    directives.setdefault("job-name", run.model_path.name.lower())
+    directives.setdefault("output", run.out_dir / "logs" / "slurm-%j.out")
+    directives.setdefault("chdir", ROOT)
+
+    lines = ["#!/bin/bash"]
+    for key, value in directives.items():
+        if value is None or value is False:
+            continue
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", key):
+            raise ValueError(f"Use a Slurm option name without leading dashes: {key!r}")
+        if value is True:
+            lines.append(f"#SBATCH --{key}")
         else:
-            cls.submit()
+            value = str(value)
+            if "\n" in value or "\r" in value:
+                raise ValueError(f"Slurm option {key!r} must have a single-line value")
+            lines.append(f"#SBATCH --{key}={shlex.quote(value)}")
 
-    @classmethod
-    def submit(cls) -> None:
-        cls.prepare_run()
-        script_path = Path(inspect.getfile(cls)).resolve()
-        run_command = shlex.join([
-            "srun",
-            sys.executable,
-            str(script_path),
-            "--train",
-            "--run",
-            str(cls._run_number),
-            "--timestamp",
-            cls._run_timestamp,
-            "--data-version",
-            str(cls._resolved_data_version),
-        ])
+    staging = [
+        "set -euo pipefail",
+        ': "${TMPDIR:?TMPDIR is required for dataset staging}"',
+        'stage_dir=$(mktemp -d "$TMPDIR/bv-ml-data.XXXXXX")',
+        'trap \'rm -rf -- "$stage_dir"\' EXIT',
+        f'export BV_ML_DATA_DIR="$stage_dir"/{shlex.quote(run.data_dir.name)}',
+        'printf \'Staging dataset to %s\\n\' "$BV_ML_DATA_DIR"',
+        f'tar -xf {shlex.quote(str(archive))} -C "$stage_dir"',
+        'test -d "$BV_ML_DATA_DIR"',
+    ]
+    script = "\n".join([*lines, "", *staging, run_command, ""])
+    result = subprocess.run(
+        ["sbatch"],
+        input=script,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"sbatch failed:\n{result.stderr.strip()}")
+    print(result.stdout.strip())
 
-        directives = cls.config.slurm.copy()
-        directives.setdefault("job-name", cls.model_path.name.lower())
-        directives.setdefault("output", cls.get_out_dir() / "logs" / "slurm-%j.out")
-        directives.setdefault("chdir", ROOT)
 
-        lines = ["#!/bin/bash"]
-        for key, value in directives.items():
-            if value is None or value is False:
-                continue
-            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", key):
-                raise ValueError(f"Use a Slurm option name without leading dashes: {key!r}")
-            if value is True:
-                lines.append(f"#SBATCH --{key}")
-            else:
-                value = str(value)
-                if "\n" in value or "\r" in value:
-                    raise ValueError(f"Slurm option {key!r} must have a single-line value")
-                lines.append(f"#SBATCH --{key}={shlex.quote(value)}")
+def _launch(
+    train: Callable[[Run], object],
+    script_path: Path,
+    slurm: dict[str, object],
+    data_version: int,
+) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--timestamp", help=argparse.SUPPRESS)
+    parser.add_argument("--season", default=SEASON, help=argparse.SUPPRESS)
+    parser.add_argument("--data-version", type=int, help=argparse.SUPPRESS)
+    args = parser.parse_args()
 
-        script = "\n".join([*lines, "", run_command, ""])
-
-        result = subprocess.run(
-            ["sbatch"],
-            input=script,
-            text=True,
-            capture_output=True,
-            check=False,
+    if args.train:
+        run = _reserve_run(
+            script_path,
+            slurm,
+            data_version if args.data_version is None else args.data_version,
+            run_timestamp=args.timestamp,
+            season=args.season,
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"sbatch failed:\n{result.stderr.strip()}")
-
-        print(result.stdout.strip())
-
-    @classmethod
-    def prepare_run(cls, run=None, timestamp=None, data_version=None):
-        if timestamp is None:
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        elif not re.fullmatch(r"\d{8}T\d{12}Z", timestamp):
-            raise ValueError("Run timestamp must have the UTC format YYYYMMDDTHHMMSSffffffZ")
-        data_version = cls.data_version if data_version is None else data_version
-        if type(data_version) is not int:
-            raise TypeError("data_version must be an integer")
-        if data_version == -1:
-            versions = cls._data_directories()
-            if not versions:
-                raise KeyError(-1)
-            data_version = max(versions)
-        if run is None:
-            with (ROOT / "run_counts.json").open("a+") as handle:
-                fcntl.flock(handle, fcntl.LOCK_EX)
-                handle.seek(0)
-                counts = json.loads(handle.read() or "{}")
-                model_key = cls.model_path.as_posix()
-                legacy_run_number = max(
-                    (value for key, value in counts.items() if key.casefold() == cls.__name__.casefold()),
-                    default=0,
-                )
-                previous_run_number = max(
-                    (value for key, value in counts.items() if key.casefold() == model_key.casefold()),
-                    default=legacy_run_number,
-                )
-                run = previous_run_number + 1
-                counts[model_key] = run
-                handle.seek(0)
-                handle.truncate()
-                json.dump(counts, handle, indent=2)
-                handle.write("\n")
-        cls._run_number = run
-        cls._run_timestamp = timestamp
-        cls._resolved_data_version = data_version
-        (cls.get_out_dir() / "logs").mkdir(parents=True, exist_ok=True)
+        _execute(train, run)
+    else:
+        _submit(script_path, _reserve_run(script_path, slurm, data_version, season=args.season))
 
 
-def configure(*, slurm={}):
-    """Merge Slurm overrides into a model's independent configuration."""
-    def apply(cls):
-        cls.config = cls.config.with_options(slurm=slurm)
-        return cls
+@overload
+def slurmable(
+    function: Callable[[Run], _Result],
+    /,
+    *,
+    DATA_VERSION: int = -1,
+) -> Callable[[], _Result]: ...
 
-    return apply
+
+@overload
+def slurmable(
+    function: None = None,
+    /,
+    *,
+    DATA_VERSION: int = -1,
+    **slurm: object,
+) -> Callable[[Callable[[Run], _Result]], Callable[[], _Result]]: ...
 
 
-def slurmable(cls):
-    if cls.__module__ == "__main__":
-        cls.launch()
-    return cls
+def slurmable(function=None, /, *, DATA_VERSION: int = -1, **slurm):
+    """Decorate train(config); running its file submits, while --train executes it.
+
+    Accepts bare @slurmable or native Slurm options such as time="01:00:00".
+    Underscores in option names become hyphens in the generated directives.
+    DATA_VERSION selects the dataset (default: -1, the latest version).
+    This reserved keyword is not passed to Slurm.
+    Importing is idle; calling the decorated function runs training directly.
+    """
+    def decorate(train):
+        if (
+            not inspect.isfunction(train)
+            or train.__qualname__ != train.__name__
+            or inspect.iscoroutinefunction(train)
+            or inspect.isgeneratorfunction(train)
+            or inspect.isasyncgenfunction(train)
+        ):
+            raise TypeError("@slurmable requires a top-level synchronous function")
+        parameters = list(inspect.signature(train).parameters.values())
+        if len(parameters) != 1 or parameters[0].kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            raise TypeError("A @slurmable function must take exactly one config argument")
+
+        script_path = Path(inspect.getfile(train)).resolve()
+        options = {**_DEFAULT_SLURM, **{key.replace("_", "-"): value for key, value in slurm.items()}}
+        data_version = DATA_VERSION
+
+        @wraps(train)
+        def wrapped():
+            return _execute(train, _reserve_run(script_path, options, data_version))
+
+        if train.__module__ == "__main__":
+            _launch(train, script_path, options, data_version)
+        return wrapped
+
+    return decorate if function is None else decorate(function)
