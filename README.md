@@ -69,20 +69,3 @@ and Slurm logs under `out/2026-2027/` in your checkout. W&B runs use the
 For later sessions, activate `bv_ml` and run the model file from the repository
 root. Environment creation, the dataset symlink, and W&B login are setup steps.
 
-## Prepare datasets when needed
-
-Skip this step when the shared dataset versions and their archives are already
-prepared. A maintainer with write access to the dataset directory can submit
-preparation for new or unprepared versions:
-
-```bash
-python prepare_datasets.py
-```
-
-This submits a CPU job to Pitzer's `cpu-exp` partition. It normalizes dataset
-names, imports ZIP files, converts YOLO annotations to COCO, and creates the
-`.tar` archives needed for training. Failed versions are skipped.
-
-Wait for preparation to finish and confirm the selected version succeeded
-before submitting training. Logs and JSON summaries are saved under
-`out/dataset-preparation/` in the checkout that submitted preparation.
