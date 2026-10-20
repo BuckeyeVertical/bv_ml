@@ -12,7 +12,7 @@ from unittest.mock import patch
 import yaml
 from PIL import Image
 
-import dataset
+import prepare_datasets
 
 
 class DatasetConversionTests(unittest.TestCase):
@@ -43,7 +43,7 @@ class DatasetConversionTests(unittest.TestCase):
 
     def convert(self, version=None):
         with contextlib.redirect_stdout(io.StringIO()) as output:
-            result = dataset.convert_yolo_to_coco(self.version if version is None else version)
+            result = prepare_datasets.convert_yolo_to_coco(self.version if version is None else version)
         return result, output.getvalue()
 
     def annotations(self, output, split="train"):
@@ -90,6 +90,35 @@ class DatasetConversionTests(unittest.TestCase):
             self.assertEqual(link.resolve(), self.yolo / "images" / split)
             self.assertEqual((link / "a.png").stat().st_ino, (self.yolo / "images" / split / "a.png").stat().st_ino)
         self.assertFalse((output / "annotations/instances_test.json").exists())
+
+    def test_exif_orientation_controls_dimensions_and_boxes_without_changing_sources(self):
+        sources = {}
+        for suffix in ("jpg", "png", "tiff"):
+            for orientation in range(1, 9):
+                image = self.add_image("train", f"orientation-{orientation}.{suffix}", "0 0.25 0.5 0.25 0.5\n")
+                exif = Image.Exif()
+                exif[274] = orientation
+                Image.new("RGB", (200, 100), "white").save(image, exif=exif)
+                sources[image] = image.read_bytes()
+
+        output, _ = self.convert()
+        coco = self.annotations(output)
+        images = {image["file_name"]: image for image in coco["images"]}
+        annotations = {annotation["image_id"]: annotation for annotation in coco["annotations"]}
+        for source in sources:
+            orientation = int(source.stem.split("-")[1])
+            with self.subTest(file=source.name):
+                image = images[source.name]
+                expected_size = (100, 200) if orientation >= 5 else (200, 100)
+                expected_bbox = [12.5, 50, 25, 100] if orientation >= 5 else [25, 25, 50, 50]
+                self.assertEqual((image["width"], image["height"]), expected_size)
+                annotation = annotations[image["id"]]
+                self.assertEqual(annotation["bbox"], expected_bbox)
+                self.assertEqual(annotation["area"], 2500)
+        for image, original in sources.items():
+            self.assertEqual(image.read_bytes(), original)
+        _, report = self.convert()
+        self.assertIn("already up to date", report)
 
     def test_visdrone_layout_and_optional_test_split(self):
         self.config.update(train="VisDrone2019-DET-train/images", val="VisDrone2019-DET-val/images", test="VisDrone2019-DET-test-dev/images")
@@ -189,6 +218,14 @@ class DatasetConversionTests(unittest.TestCase):
         self.assertEqual((output / "images/train").resolve(), moved / "yolo/images/train")
         self.assertIn("already up to date", report)
 
+    def test_old_conversion_version_is_preserved_and_requires_regeneration(self):
+        with patch.object(prepare_datasets, "_FORMAT_VERSION", 1):
+            output, _ = self.convert()
+        original = {path: path.read_bytes() for path in output.rglob("*.json")}
+        with self.assertRaisesRegex(ValueError, "conversion version 1.*Move the generated coco directory aside and rerun"):
+            self.convert()
+        self.assertEqual({path: path.read_bytes() for path in original}, original)
+
     def test_source_changes_require_new_versions_and_preserve_output(self):
         self.convert()
         for change in ("labels", "yaml", "pixels", "new_image", "removed_image"):
@@ -264,7 +301,7 @@ class DatasetConversionTests(unittest.TestCase):
                     self.convert()
 
     def test_failure_after_writing_annotations_cleans_staging(self):
-        original = dataset._write_json
+        original = prepare_datasets._write_json
 
         def fail_second(path, value):
             if path.name == "instances_val.json":
@@ -272,14 +309,14 @@ class DatasetConversionTests(unittest.TestCase):
             original(path, value)
 
         with (
-            patch.object(dataset, "_write_json", side_effect=fail_second),
+            patch.object(prepare_datasets, "_write_json", side_effect=fail_second),
             self.assertRaisesRegex(OSError, "simulated disk failure"),
         ):
             self.convert()
         self.assert_no_partial_output()
 
     def test_source_changes_during_conversion_abort_publication(self):
-        original = dataset._write_json
+        original = prepare_datasets._write_json
 
         def edit_source(path, value):
             original(path, value)
@@ -287,7 +324,7 @@ class DatasetConversionTests(unittest.TestCase):
                 (self.yolo / "labels/train/a.txt").write_text("0 0.5 0.5 0.3 0.3\n")
 
         with (
-            patch.object(dataset, "_write_json", side_effect=edit_source),
+            patch.object(prepare_datasets, "_write_json", side_effect=edit_source),
             self.assertRaisesRegex(ValueError, "source changed during conversion"),
         ):
             self.convert()
@@ -296,10 +333,10 @@ class DatasetConversionTests(unittest.TestCase):
     def test_concurrent_conversions_only_build_once(self):
         with (
             contextlib.redirect_stdout(io.StringIO()),
-            patch.object(dataset, "_convert_split", wraps=dataset._convert_split) as convert,
+            patch.object(prepare_datasets, "_convert_split", wraps=prepare_datasets._convert_split) as convert,
             ThreadPoolExecutor(max_workers=3) as pool,
         ):
-            results = list(pool.map(dataset.convert_yolo_to_coco, [self.version] * 3))
+            results = list(pool.map(prepare_datasets.convert_yolo_to_coco, [self.version] * 3))
         self.assertEqual(results, [self.version / "coco"] * 3)
         self.assertEqual(convert.call_count, 2)
         self.assertEqual(list(self.version.glob(".coco-*")), [])
@@ -319,24 +356,17 @@ class DatasetConversionTests(unittest.TestCase):
                     self.convert()
                 self.assert_no_partial_output()
 
-    def test_version_selection_and_cli(self):
-        with patch.object(dataset, "ROOT", self.root):
-            (self.root / "data").mkdir()
-            shutil.move(self.version, self.root / "data/v001.example")
-            self.assertEqual(dataset._resolve_version(1), self.root / "data/v001.example")
-            (self.root / "data/v010.latest").mkdir()
-            (self.root / "data/v2.old").mkdir()
-            self.assertEqual(dataset._resolve_version(2), self.root / "data/v2.old")
-            self.assertEqual(dataset._resolve_version(-1), self.root / "data/v010.latest")
-            with self.assertRaisesRegex(ValueError, "not found"):
-                dataset._resolve_version(9)
-            (self.root / "data/v1.duplicate").mkdir()
-            with self.assertRaisesRegex(ValueError, "Ambiguous"):
-                dataset._resolve_version(1)
-            (self.root / "data/v1.duplicate").rmdir()
-            with patch("sys.argv", ["dataset.py", "convert", "--version", "1", "--to", "coco"]), contextlib.redirect_stdout(io.StringIO()):
-                dataset.main()
-            self.assertTrue((self.root / "data/v001.example/coco/manifest.json").is_file())
+    def test_consolidated_cli_converts_and_archives_the_dataset(self):
+        data_root = self.root / "data"
+        data_root.mkdir()
+        shutil.move(self.version, data_root / "v001.example")
+        report = self.root / "summary.json"
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = prepare_datasets.main(["--run", "--data-root", str(data_root), "--report", str(report)])
+        self.assertEqual(status, 0)
+        self.assertTrue((data_root / "v001.example/coco/manifest.json").is_file())
+        self.assertTrue((data_root / "archives/v001.example.tar").is_file())
+        self.assertEqual(json.loads(report.read_text())["prepared"][0]["version"], "v001.example")
 
 
 if __name__ == "__main__":

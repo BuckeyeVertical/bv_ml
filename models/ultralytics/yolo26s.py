@@ -13,7 +13,7 @@ def train(config):
 
     YOLO(str(config.model_cache_dir / "yolo26s.pt")).train(
         data=str(config.data_dir / "yolo" / "data.yaml"),
-        save_dir=config.out_dir,
+        save_dir=config.train_out_dir,
         epochs=100,
         imgsz=640,
         batch=4,

@@ -1,19 +1,21 @@
 import argparse
-import fcntl
 import inspect
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import TypeVar, overload
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent
+SEASON = "2026-2027"
 
 _DEFAULT_SLURM = {
     "account": "PAS3560",
@@ -30,6 +32,19 @@ _Result = TypeVar("_Result")
 
 
 @dataclass(frozen=True)
+class WandbConfig:
+    """Framework-independent settings for the W&B run owned by the wrapper."""
+
+    entity: str
+    project: str
+    group: str
+    name: str
+    id: str
+    dir: str
+    mode: str = "online"
+
+
+@dataclass(frozen=True)
 class Run:
     """Paths, resources, and reserved metadata for one training invocation."""
 
@@ -38,32 +53,27 @@ class Run:
     model_cache_dir: Path
     slurm: dict[str, object]
     model_path: Path
-    run_number: int
+    run_id: str
     run_timestamp: str
     data_version: int
+    season: str = SEASON
 
+    @property
+    def train_out_dir(self) -> Path:
+        """Training output directory that frameworks can recreate safely."""
+        return self.out_dir / "train"
 
-def _next_run_number(model_path: Path) -> int:
-    with (ROOT / "run_counts.json").open("a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        handle.seek(0)
-        counts = json.loads(handle.read() or "{}")
-        model_key = model_path.as_posix()
-        legacy_run_number = max(
-            (value for key, value in counts.items() if key.casefold() == model_path.name.casefold()),
-            default=0,
+    @property
+    def wandb(self) -> WandbConfig:
+        """W&B settings available to training code before logging starts."""
+        return WandbConfig(
+            entity="BuckeyeVertical",
+            project=f"season-{self.season}",
+            group=self.model_path.as_posix(),
+            name=self.out_dir.name,
+            id=self.run_id,
+            dir=str(self.out_dir),
         )
-        previous_run_number = max(
-            (value for key, value in counts.items() if key.casefold() == model_key.casefold()),
-            default=legacy_run_number,
-        )
-        run_number = previous_run_number + 1
-        counts[model_key] = run_number
-        handle.seek(0)
-        handle.truncate()
-        json.dump(counts, handle, indent=2)
-        handle.write("\n")
-    return run_number
 
 
 def _reserve_run(
@@ -71,10 +81,12 @@ def _reserve_run(
     slurm: dict[str, object],
     data_version: int,
     *,
-    run_number: int | None = None,
     run_timestamp: str | None = None,
+    season: str = SEASON,
 ) -> Run:
-    reserved = run_number is not None and run_timestamp is not None
+    reserved = run_timestamp is not None
+    if not re.fullmatch(r"\d{4}-\d{4}", season) or int(season[5:]) != int(season[:4]) + 1:
+        raise ValueError("Season must name consecutive years, such as 2026-2027")
     if run_timestamp is None:
         run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     elif not re.fullmatch(r"\d{8}T\d{12}Z", run_timestamp):
@@ -96,14 +108,27 @@ def _reserve_run(
     if model_path.parts[0] == "models":
         model_path = Path(*model_path.parts[1:])
     model_path = model_path.with_suffix("")
-    if run_number is None:
-        run_number = _next_run_number(model_path)
-    out_dir = ROOT / "out" / model_path / f"v{run_number:03d}.dv{data_version:03d}.{timestamp:%m-%d-%y}"
+    out_dir = ROOT / "out" / season / model_path / f"{model_path.name}.{timestamp:%y-%m-%d-%H%M%S}.dv{data_version:03d}"
+    metadata = {
+        "season": season,
+        "model_path": model_path.as_posix(),
+        "run_timestamp": run_timestamp,
+        "data_version": data_version,
+    }
     if reserved:
-        # Jobs submitted before the naming change already have Slurm logs here.
-        legacy_dir = ROOT / "out" / model_path / f"v{run_number}.dv{data_version}.{timestamp:%m-%d-%H:%M-%y}"
-        if not out_dir.exists() and legacy_dir.is_dir():
-            out_dir = legacy_dir
+        saved = json.loads((out_dir / "run.json").read_text())
+        if not isinstance(saved, dict) or any(saved.get(key) != value for key, value in metadata.items()):
+            raise ValueError(f"Reserved run metadata does not match: {out_dir}")
+        run_id = saved.get("run_id")
+        if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{32}", run_id):
+            raise ValueError(f"Reserved run has an invalid W&B run ID: {out_dir}")
+    else:
+        try:
+            out_dir.mkdir(parents=True)
+        except FileExistsError as error:
+            raise FileExistsError(f"Run output already exists: {out_dir}. Retry after the current second.") from error
+        run_id = uuid4().hex
+        (out_dir / "run.json").write_text(json.dumps({**metadata, "run_id": run_id}, indent=2) + "\n")
     (out_dir / "logs").mkdir(parents=True, exist_ok=True)
     return Run(
         data_dir=data_dir,
@@ -111,44 +136,56 @@ def _reserve_run(
         model_cache_dir=ROOT / ".modelcache",
         slurm=slurm.copy(),
         model_path=model_path,
-        run_number=run_number,
+        run_id=run_id,
         run_timestamp=run_timestamp,
         data_version=data_version,
+        season=season,
     )
 
 
 def _execute(train: Callable[[Run], _Result], config: Run) -> _Result:
+    staged_dir = os.environ.get("BV_ML_DATA_DIR")
+    if staged_dir:
+        data_dir = Path(staged_dir).resolve(strict=True)
+        if not data_dir.is_dir() or data_dir.name != config.data_dir.name:
+            raise ValueError(f"Staged dataset must be a directory named {config.data_dir.name}: {data_dir}")
+        config = replace(config, data_dir=data_dir)
+
     import wandb
 
     print(config)
-    group = config.model_path.as_posix()
     with wandb.init(
-        project=ROOT.name,
-        mode="online",
-        group=group,
-        name=f"{group}/{config.out_dir.name}",
-        dir=str(config.out_dir),
+        **asdict(config.wandb),
         config={
-            "model_path": group,
+            "model_path": config.model_path.as_posix(),
             "model": config.model_path.name,
-            "run_number": config.run_number,
+            "run_id": config.run_id,
             "run_timestamp": config.run_timestamp,
             "data_version": config.data_version,
+            "season": config.season,
         },
     ):
         return train(config)
 
 
 def _submit(script_path: Path, run: Run) -> None:
+    if str(run.slurm.get("nodes") or 1) != "1":
+        raise ValueError("Dataset staging currently supports single-node jobs only")
+    archive = ROOT / "data" / "archives" / f"{run.data_dir.name}.tar"
+    if not archive.is_file():
+        command = shlex.join([sys.executable, str(ROOT / "prepare_datasets.py")])
+        raise FileNotFoundError(f"Dataset archive not found: {archive}. Submit CPU dataset preparation with: {command}")
+
     run_command = shlex.join([
         "srun",
+        f"--cpus-per-task={run.slurm.get('cpus-per-task') or 1}",
         sys.executable,
         str(script_path),
         "--train",
-        "--run",
-        str(run.run_number),
         "--timestamp",
         run.run_timestamp,
+        "--season",
+        run.season,
         "--data-version",
         str(run.data_version),
     ])
@@ -171,7 +208,17 @@ def _submit(script_path: Path, run: Run) -> None:
                 raise ValueError(f"Slurm option {key!r} must have a single-line value")
             lines.append(f"#SBATCH --{key}={shlex.quote(value)}")
 
-    script = "\n".join([*lines, "", run_command, ""])
+    staging = [
+        "set -euo pipefail",
+        ': "${TMPDIR:?TMPDIR is required for dataset staging}"',
+        'stage_dir=$(mktemp -d "$TMPDIR/bv-ml-data.XXXXXX")',
+        'trap \'rm -rf -- "$stage_dir"\' EXIT',
+        f'export BV_ML_DATA_DIR="$stage_dir"/{shlex.quote(run.data_dir.name)}',
+        'printf \'Staging dataset to %s\\n\' "$BV_ML_DATA_DIR"',
+        f'tar -xf {shlex.quote(str(archive))} -C "$stage_dir"',
+        'test -d "$BV_ML_DATA_DIR"',
+    ]
+    script = "\n".join([*lines, "", *staging, run_command, ""])
     result = subprocess.run(
         ["sbatch"],
         input=script,
@@ -192,8 +239,8 @@ def _launch(
 ) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--run", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--timestamp", help=argparse.SUPPRESS)
+    parser.add_argument("--season", default=SEASON, help=argparse.SUPPRESS)
     parser.add_argument("--data-version", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -202,12 +249,12 @@ def _launch(
             script_path,
             slurm,
             data_version if args.data_version is None else args.data_version,
-            run_number=args.run,
             run_timestamp=args.timestamp,
+            season=args.season,
         )
         _execute(train, run)
     else:
-        _submit(script_path, _reserve_run(script_path, slurm, data_version))
+        _submit(script_path, _reserve_run(script_path, slurm, data_version, season=args.season))
 
 
 @overload

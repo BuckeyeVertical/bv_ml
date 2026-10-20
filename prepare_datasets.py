@@ -1,3 +1,5 @@
+"""Submit YOLO-to-COCO conversion and dataset archiving to an OSC CPU node."""
+
 import argparse
 import fcntl
 import hashlib
@@ -5,16 +7,24 @@ import json
 import math
 import os
 import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import zipfile
 from dataclasses import dataclass
-from pathlib import Path
-from tempfile import TemporaryDirectory
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory, mkdtemp
 
 import yaml
 from PIL import Image
 
 from base import ROOT
 
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
 _BOUNDARY_TOLERANCE = 1e-6
 _IMAGE_SUFFIXES = {
     ".avif", ".bmp", ".dng", ".heic", ".jpeg", ".jpg", ".mpo",
@@ -157,8 +167,16 @@ def _convert_split(yolo: Path, split: _Split, categories: list[dict]) -> tuple[d
     for image_id, path in enumerate(split.images, start=1):
         try:
             with Image.open(path) as image:
-                width, height = image.size
                 image.verify()
+            # Reopen after verification: reading PNG EXIF can load the pixels.
+            with Image.open(path) as image:
+                # Pillow applies TIFF orientation and clears its tag on load.
+                if image.format == "TIFF":
+                    image.load()
+                width, height = image.size
+                # YOLO labels use the image's displayed orientation already.
+                if image.getexif().get(274) in (5, 6, 7, 8):
+                    width, height = height, width
         except (OSError, SyntaxError, ValueError) as error:
             raise ValueError(f"Unreadable image {path}: {error}") from error
         images.append({
@@ -235,8 +253,14 @@ def _existing_manifest(destination: Path, fingerprint: str, splits: list[_Split]
         if (destination / "manifest.json").is_symlink():
             raise ValueError(repair)
         manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
-        if manifest["format"] != "coco-detection" or type(manifest["format_version"]) is not int or manifest["format_version"] != _FORMAT_VERSION:
+        if manifest["format"] != "coco-detection" or type(manifest["format_version"]) is not int:
             raise ValueError(repair)
+        if manifest["format_version"] != _FORMAT_VERSION:
+            raise ValueError(
+                f"COCO conversion version {manifest['format_version']} is unsupported "
+                f"(expected {_FORMAT_VERSION}): {destination}. "
+                "Move the generated coco directory aside and rerun."
+            )
         source_fingerprint = manifest["source_fingerprint"]
         if not isinstance(source_fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", source_fingerprint):
             raise ValueError(repair)
@@ -337,34 +361,286 @@ def convert_yolo_to_coco(version_dir: Path) -> Path:
         return destination
 
 
-def _resolve_version(version: int) -> Path:
-    versions = {}
-    for path in sorted((ROOT / "data").iterdir()):
-        match = re.fullmatch(r"v(\d+)(?:\..+)?", path.name)
-        if match and path.is_dir():
-            versions.setdefault(int(match[1]), []).append(path)
-    if version == -1:
-        version = max(versions, default=-1)
-    matches = versions.get(version, [])
-    if not matches:
-        raise ValueError(f"Dataset version {version} not found under {ROOT / 'data'}")
-    if len(matches) != 1:
-        raise ValueError(f"Ambiguous dataset version {version}: {', '.join(path.name for path in matches)}")
-    return matches[0]
+def archive_dataset(version_dir: Path, *, force: bool = False) -> Path:
+    """Prepare an atomic, reusable tar archive while preserving dataset links."""
+    version_dir = Path(version_dir).absolute()
+    version_name = version_dir.name
+    destination = version_dir.parent / "archives" / f"{version_name}.tar"
+    version_dir = version_dir.resolve(strict=True)
+    if not version_dir.is_dir():
+        raise ValueError(f"Not a dataset version directory: {version_dir}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if destination.exists() and not force:
+            if not destination.is_file():
+                raise ValueError(f"Dataset archive is not a file: {destination}")
+            print(f"Dataset archive already exists: {destination}")
+            return destination
+        print(f"Archiving dataset: {version_dir}", flush=True)
+        with TemporaryDirectory(prefix=f".{version_dir.name}-", dir=destination.parent) as temporary:
+            archive_path = Path(temporary) / "dataset.tar"
+            with tarfile.open(archive_path, "w", dereference=False) as archive:
+                archive.add(version_dir, arcname=version_name)
+            archive_path.replace(destination)
+    print(f"Dataset archive ready: {destination}")
+    return destination
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="command", required=True)
-    convert = commands.add_parser("convert", help="Generate a derived format from a version's YOLO source")
-    convert.add_argument("--version", type=int, required=True, help="Dataset version, or -1 for latest")
-    convert.add_argument("--to", choices=["coco"], required=True, help="Output format")
-    args = parser.parse_args()
+_VERSION = re.compile(r"v(\d+)(?:\.(.+))?")
+
+
+def _version_name(name: str, number: int) -> str:
+    match = _VERSION.fullmatch(name)
+    suffix = match[2] if match else name
+    return f"v{number:03d}" + (f".{suffix}" if suffix else "")
+
+
+def _canonical_version(name: str) -> bool:
+    match = _VERSION.fullmatch(name)
+    return match is not None and _version_name(name, int(match[1])) == name
+
+
+def _wrap_yolo(source: Path, destination: Path) -> None:
+    """Move raw YOLO into a version root, restoring the source if publishing fails."""
+    if source.is_symlink():
+        raise ValueError(f"Raw YOLO must be a real directory, not a symlink: {source}")
+    staging = Path(mkdtemp(prefix=".prepare-layout-", dir=destination.parent))
     try:
-        convert_yolo_to_coco(_resolve_version(args.version))
-    except (OSError, TypeError, ValueError, yaml.YAMLError) as error:
+        source.rename(staging / "yolo")
+        staging.rename(destination)
+    except BaseException:
+        if (staging / "yolo").exists():
+            (staging / "yolo").rename(source)
+        staging.rmdir()
+        raise
+
+
+def _extract_zip(source: Path, destination: Path) -> Path:
+    """Extract one dataset, allowing only paths and links inside the staging root."""
+    with zipfile.ZipFile(source) as archive:
+        for member in archive.infolist():
+            name = member.filename.replace("\\", "/")
+            relative = PurePosixPath(name)
+            if relative.is_absolute() or ".." in relative.parts or re.match(r"^[A-Za-z]:", name):
+                raise ValueError(f"ZIP member escapes its dataset directory: {member.filename}")
+            if not relative.parts or "__MACOSX" in relative.parts or relative.name == ".DS_Store":
+                continue
+            target = destination.joinpath(*relative.parts)
+            if not target.resolve().is_relative_to(destination.resolve()):
+                raise ValueError(f"ZIP member escapes its dataset directory: {member.filename}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if member.is_dir():
+                target.mkdir(exist_ok=True)
+            elif stat.S_ISLNK(member.external_attr >> 16):
+                link = archive.read(member).decode("utf-8")
+                if Path(link).is_absolute() or not (target.parent / link).resolve().is_relative_to(destination.resolve()):
+                    raise ValueError(f"ZIP symlink escapes its dataset directory: {member.filename}")
+                target.symlink_to(link)
+            else:
+                with archive.open(member) as incoming, target.open("wb") as outgoing:
+                    shutil.copyfileobj(incoming, outgoing)
+
+    root = destination
+    while not (root / "yolo").is_dir() and not (root / "data.yaml").is_file():
+        children = [path for path in root.iterdir() if not path.name.startswith(".")]
+        if len(children) != 1 or not children[0].is_dir():
+            raise ValueError("ZIP must contain one dataset with yolo/ or a raw YOLO data.yaml")
+        root = children[0]
+    return root
+
+
+def _save_imports(path: Path, imports: dict) -> None:
+    temporary = path.with_suffix(".tmp")
+    try:
+        temporary.write_text(json.dumps(imports, indent=2) + "\n")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _prepare_inputs(data_root: Path, summary: dict) -> list[Path]:
+    manifest = data_root / ".prepared-zips.json"
+    imports = json.loads(manifest.read_text()) if manifest.exists() else {}
+    if not isinstance(imports, dict) or any(not isinstance(item, dict) for item in imports.values()):
+        raise ValueError(f"Invalid ZIP import manifest: {manifest}")
+    folders = []
+    zips = []
+    for path in sorted(data_root.iterdir()):
+        if path.name.startswith(".") or path.name == "archives":
+            continue
+        if path.is_dir() and (_VERSION.fullmatch(path.name) or (path / "yolo").is_dir() or (path / "data.yaml").is_file()):
+            folders.append(path)
+        elif path.is_file() and path.suffix.lower() == ".zip":
+            zips.append(path)
+
+    numbers = [_VERSION.fullmatch(path.name) for path in folders]
+    numbers.extend(_VERSION.fullmatch(path.stem) for path in zips)
+    latest = max((int(match[1]) for match in numbers if match), default=0)
+    used = set()
+
+    def allocate(name, source=None):
+        nonlocal latest
+        match = _VERSION.fullmatch(name)
+        number = int(match[1]) if match else latest + 1
+        while True:
+            destination = data_root / _version_name(name, number)
+            occupied = destination != source and (destination.exists() or destination.is_symlink())
+            if number not in used and not occupied:
+                used.add(number)
+                latest = max(latest, number)
+                return destination
+            number = latest + 1
+            latest = number
+
+    def record_failure(source, stage, error):
+        message = f"{type(error).__name__}: {error}"
+        summary["skipped"].append({"version": source.name, "stage": stage, "error": message})
+        print(f"SKIPPED {source.name} during {stage}: {message}", flush=True)
+
+    versions = []
+    folders.sort(key=lambda path: (not _canonical_version(path.name), path.name))
+    for source in folders:
+        try:
+            destination = allocate(source.name, source)
+            raw = (source / "data.yaml").is_file() and not (source / "yolo").is_dir()
+            if raw:
+                _wrap_yolo(source, destination)
+                summary["wrapped"].append(destination.name)
+                print(f"Wrapped raw YOLO: {source.name} -> {destination.name}/yolo", flush=True)
+            elif destination != source:
+                source.rename(destination)
+            if destination != source:
+                summary["renamed"].append({"from": source.name, "to": destination.name})
+                print(f"Renamed dataset: {source.name} -> {destination.name}", flush=True)
+                for imported in imports.values():
+                    if imported.get("dataset") == source.name:
+                        imported["dataset"] = destination.name
+                if imports:
+                    _save_imports(manifest, imports)
+            versions.append(destination)
+        except Exception as error:  # noqa: BLE001 - Normalize each dataset independently.
+            record_failure(source, "normalize", error)
+
+    for source in zips:
+        try:
+            digest = _sha256(source)
+            previous = imports.get(source.name, {})
+            if previous.get("sha256") == digest and any(path.name == previous.get("dataset") for path in versions):
+                print(f"ZIP already imported: {source.name} -> {previous['dataset']}", flush=True)
+                continue
+            with TemporaryDirectory(prefix=".prepare-zip-", dir=data_root) as temporary:
+                extracted = Path(temporary) / "contents"
+                extracted.mkdir()
+                root = _extract_zip(source, extracted)
+                destination = allocate(source.stem)
+                imports[source.name] = {"sha256": digest, "dataset": destination.name}
+                # Save the intended destination first so an interrupted publish cannot cause duplicate imports.
+                _save_imports(manifest, imports)
+                if (root / "data.yaml").is_file() and not (root / "yolo").is_dir():
+                    _wrap_yolo(root, destination)
+                    summary["wrapped"].append(destination.name)
+                else:
+                    root.rename(destination)
+            versions.append(destination)
+            summary["imported"].append({"source": source.name, "version": destination.name})
+            print(f"Imported ZIP: {source.name} -> {destination.name}", flush=True)
+        except Exception as error:  # noqa: BLE001 - A bad ZIP must not stop later inputs.
+            record_failure(source, "extract", error)
+
+    return sorted(versions, key=lambda path: (int(_VERSION.fullmatch(path.name)[1]), path.name))
+
+
+def prepare_datasets(data_root: Path) -> dict:
+    """Normalize inputs, convert, and archive versions without stopping on a bad input."""
+    data_root = Path(data_root).resolve(strict=True)
+    summary = {"data_root": str(data_root), "prepared": [], "skipped": [], "renamed": [], "wrapped": [], "imported": []}
+    with (data_root / ".prepare.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        versions = _prepare_inputs(data_root, summary)
+        if not versions and not summary["skipped"]:
+            raise ValueError(f"No dataset versions found under {data_root}")
+        for version_dir in versions:
+            print(f"Preparing dataset: {version_dir.name}", flush=True)
+            stage = "coco"
+            try:
+                coco_dir = convert_yolo_to_coco(version_dir)
+                stage = "archive"
+                archive = archive_dataset(version_dir, force=True)
+            except Exception as error:  # noqa: BLE001 - A failed version must not stop later datasets.
+                message = f"{type(error).__name__}: {error}"
+                summary["skipped"].append({"version": version_dir.name, "stage": stage, "error": message})
+                print(f"SKIPPED {version_dir.name} during {stage}: {message}", flush=True)
+                continue
+            summary["prepared"].append({"version": version_dir.name, "coco_dir": str(coco_dir), "archive": str(archive)})
+            print(f"READY {version_dir.name}: {archive}", flush=True)
+
+    print(f"Preparation finished: {len(summary['prepared'])} prepared, {len(summary['skipped'])} skipped", flush=True)
+    return summary
+
+
+def _submit(args: argparse.Namespace) -> None:
+    log_dir = ROOT / "out" / "dataset-preparation"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        "srun", f"--cpus-per-task={args.cpus}", sys.executable, "-u", str(Path(__file__).resolve()),
+        "--run", "--data-root", str(args.data_root),
+    ]
+    if args.report is not None:
+        command.extend(["--report", str(args.report.resolve())])
+    script = "\n".join(["#!/bin/bash", "set -euo pipefail", shlex.join(command), ""])
+    result = subprocess.run(
+        [
+            "sbatch",
+            f"--account={args.account}",
+            f"--clusters={args.cluster}",
+            f"--partition={args.partition}",
+            "--nodes=1",
+            "--ntasks=1",
+            f"--cpus-per-task={args.cpus}",
+            f"--time={args.time}",
+            "--job-name=prepare-datasets",
+            f"--chdir={ROOT}",
+            f"--output={log_dir / 'slurm-%j.out'}",
+        ],
+        input=script, text=True, capture_output=True, check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"sbatch failed:\n{result.stderr.strip()}")
+    print(result.stdout.strip())
+    print(f"Preparation logs: {log_dir / 'slurm-<job-id>.out'}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run", action="store_true", help="Prepare datasets directly inside an existing compute allocation")
+    parser.add_argument("--data-root", type=Path, default=ROOT / "data", help="Directory containing dataset versions")
+    parser.add_argument("--report", type=Path, help="JSON summary path (default: out/dataset-preparation/summary-<job-id>.json)")
+    parser.add_argument("--account", default="PAS3560")
+    parser.add_argument("--cluster", default="pitzer")
+    parser.add_argument("--partition", default="cpu-exp")
+    parser.add_argument("--cpus", type=int, default=1)
+    parser.add_argument("--time", default="04:00:00")
+    args = parser.parse_args(argv)
+    if args.cpus < 1:
+        parser.error("--cpus must be at least 1")
+    try:
+        args.data_root = args.data_root.resolve(strict=True)
+        if not args.data_root.is_dir():
+            raise ValueError(f"Not a dataset directory: {args.data_root}")
+        if not args.run:
+            _submit(args)
+            return 0
+        summary = prepare_datasets(args.data_root)
+        job_id = os.environ.get("SLURM_JOB_ID") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        report = args.report or ROOT / "out" / "dataset-preparation" / f"summary-{job_id}.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(summary, indent=2) + "\n")
+        print(f"Preparation summary: {report}", flush=True)
+        return 0 if summary["prepared"] else 1
+    except (OSError, ValueError, RuntimeError) as error:
         parser.exit(1, f"error: {error}\n")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
