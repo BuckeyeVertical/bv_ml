@@ -64,32 +64,6 @@ Both adapters read the entity from `run.wandb_entity`, which defaults to
 `BuckeyeVertical` in `base.Run`. LightlyTrain passes this value through a temporary
 `WANDB_ENTITY` setting and restores the previous environment after training.
 
-## Convert the CPPE-5 Parquet dataset
-
-With `bv_ml` active, convert the local files in `data/v002/`:
-
-```bash
-python convert_cppe5_to_yolo.py --source data/v002
-```
-
-This writes `data/v002/yolo/data.yaml`, `images/{train,val,test}/`, matching
-`labels/` directories, and a `conversion.json` report. The converter reads class
-names from the Parquet metadata and converts COCO pixel boxes to normalized YOLO
-boxes. It removes exact duplicate images, retaining test images over training
-duplicates, and reserves 10% of the remaining training images for validation
-with seed 42. The original test split is otherwise preserved. Box clipping and
-skipped zero-area boxes are recorded in the report. JPEG/PNG images keep their
-original encoding with the correct extension; JPEGs missing end markers are
-exported as PNG and recorded as repairs. Original Parquet files are
-preserved; an existing output directory is never overwritten.
-
-Use `--val-fraction`, `--seed`, or `--output` to change those defaults. Install
-`pyarrow==26.0.0` if updating an environment created before this converter.
-
-Then run `python prepare_datasets.py` to submit the existing CPU preparation job
-that generates COCO annotations and training archives. Conversion alone does
-not create the archive required by the training launcher.
-
 ## Submit a training job
 
 Once setup is complete and the shared dataset is prepared, run a model file:
