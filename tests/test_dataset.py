@@ -91,6 +91,24 @@ class DatasetConversionTests(unittest.TestCase):
             self.assertEqual((link / "a.png").stat().st_ino, (self.yolo / "images" / split / "a.png").stat().st_ino)
         self.assertFalse((output / "annotations/instances_test.json").exists())
 
+    def test_coco_publication_and_reuse_keep_outputs_readable_with_a_private_umask(self):
+        previous_umask = os.umask(0o077)
+        try:
+            output, _ = self.convert()
+            paths = [output, *output.rglob("*")]
+            for path in paths:
+                if not path.is_symlink():
+                    required = 0o055 if path.is_dir() else 0o044
+                    self.assertEqual(path.stat().st_mode & required, required)
+            output.chmod(0o700)
+            annotation = output / "annotations/instances_train.json"
+            annotation.chmod(0o600)
+            self.convert()
+            self.assertEqual(output.stat().st_mode & 0o055, 0o055)
+            self.assertEqual(annotation.stat().st_mode & 0o044, 0o044)
+        finally:
+            os.umask(previous_umask)
+
     def test_exif_orientation_controls_dimensions_and_boxes_without_changing_sources(self):
         sources = {}
         for suffix in ("jpg", "png", "tiff"):

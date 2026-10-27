@@ -29,14 +29,15 @@ root with this environment active.
 
 ### 3. Link the shared datasets
 
-In your new checkout, create `data/` as a symlink to Trevor's dataset directory:
+In your checkout, link the shared dataset directory:
 
 ```bash
-ln -s /fs/scratch/PAS3560/trevor/bv_ml/data data
+ln -s /users/PAS3560/clute/data data
 ```
 
-This points to the shared storage at `/fs/scratch/PAS3560/data`. Training only
-needs read access to it. Each selected dataset must already have a version
+The shared datasets are readable by all OSC users. Dataset preparation keeps
+files readable and directories traversable without adding write access.
+Each selected dataset must already have a version
 directory, such as `data/v001.visdrone/`, and its prepared archive at
 `data/archives/v001.visdrone.tar`.
 
@@ -47,7 +48,43 @@ wandb login
 ```
 
 Use your own W&B API key for an account with access to `BuckeyeVertical`.
-The training wrapper starts a W&B run using the settings in `base.py`.
+Each framework directory defines its W&B behavior in `__wandb__.py`. When
+training starts, `slurmable` loads that file beside the model script and runs
+`train(run)` inside its `track(run)` context. Importing a model or submitting a
+job does not load the adapter or connect to W&B.
+
+The Ultralytics adapter registers logging callbacks; the LightlyTrain adapter
+supplies native logger settings. Both handle worker ranks and close W&B on
+success or failure. Model files contain only training code and settings.
+Runs use `BuckeyeVertical/season-2026-2027`. To add another framework, place a
+`__wandb__.py` exposing a `track(run)` context manager beside its model scripts.
+Directories without an adapter run training directly.
+
+## Convert the CPPE-5 Parquet dataset
+
+With `bv_ml` active, convert the local files in `data/v002/`:
+
+```bash
+python convert_cppe5_to_yolo.py --source data/v002
+```
+
+This writes `data/v002/yolo/data.yaml`, `images/{train,val,test}/`, matching
+`labels/` directories, and a `conversion.json` report. The converter reads class
+names from the Parquet metadata and converts COCO pixel boxes to normalized YOLO
+boxes. It removes exact duplicate images, retaining test images over training
+duplicates, and reserves 10% of the remaining training images for validation
+with seed 42. The original test split is otherwise preserved. Box clipping and
+skipped zero-area boxes are recorded in the report. JPEG/PNG images keep their
+original encoding with the correct extension; JPEGs missing end markers are
+exported as PNG and recorded as repairs. Original Parquet files are
+preserved; an existing output directory is never overwritten.
+
+Use `--val-fraction`, `--seed`, or `--output` to change those defaults. Install
+`pyarrow==26.0.0` if updating an environment created before this converter.
+
+Then run `python prepare_datasets.py` to submit the existing CPU preparation job
+that generates COCO annotations and training archives. Conversion alone does
+not create the archive required by the training launcher.
 
 ## Submit a training job
 
@@ -55,11 +92,20 @@ Once setup is complete and the shared dataset is prepared, run a model file:
 
 ```bash
 python models/ultralytics/yolo26s.py
+# Or:
+python models/lightly/ltdetrv2-s.py
 ```
 
 The file submits its job through `sbatch` automatically. The current model uses
-Pitzer's `gpu-exp` partition under `PAS3560`; its Slurm resources and training
-settings are defined in the model file.
+Pitzer's `gpu-exp` partition under `PAS3560`. Default Slurm resources live in
+`base.py`; model decorators override them. Training settings live in each model.
+
+Model entry points use `train(run)`. The `run` object provides `data_dir` (the
+selected dataset, staged on the compute node), `train_out_dir`, `out_dir`,
+`model_cache_dir`, and Slurm resources. Set `DATA_VERSION=1` in `@slurmable(...)`
+to pin a dataset; the default, `-1`, selects the latest version at submission.
+
+To train inside an existing allocation, append `--train` to the model command.
 
 The launcher selects the highest numeric dataset version and extracts its
 archive into the compute node's `$TMPDIR` before training. It writes results
@@ -68,4 +114,3 @@ and Slurm logs under `out/2026-2027/` in your checkout. W&B runs use the
 
 For later sessions, activate `bv_ml` and run the model file from the repository
 root. Environment creation, the dataset symlink, and W&B login are setup steps.
-

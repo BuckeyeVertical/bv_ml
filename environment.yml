@@ -16,9 +16,12 @@ dependencies:
       # YOLO26 training and online run tracking.
       - ultralytics==8.4.175
       - wandb==0.30.0
+      # LTDETRv2 object detection and its local DDP launcher.
+      - lightly-train==0.17.0
       # Ultralytics requires this when launching multi-GPU workers.
       - cloudpickle==3.1.1
       # Dataset conversion and repository checks.
+      - pyarrow==26.0.0
       - PyYAML==6.0.3
       - Pillow==12.3.0
       - ruff==0.16.10

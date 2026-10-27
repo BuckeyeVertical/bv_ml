@@ -11,7 +11,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 from PIL import Image
 
@@ -142,21 +142,18 @@ class DatasetStagingTests(unittest.TestCase):
     def test_wrapper_changes_only_the_dataset_path(self):
         staged = self.scratch / self.version.name
         shutil.copytree(self.version, staged, symlinks=True)
-        wandb = MagicMock()
         with (
             patch.dict(os.environ, {"BV_ML_DATA_DIR": str(staged)}),
-            patch.dict(sys.modules, {"wandb": wandb}),
+            patch.dict(sys.modules, {"wandb": None}),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             received = base._execute(lambda config: config, self.config)
         self.assertEqual(received, replace(self.config, data_dir=staged))
         self.assertEqual(received.train_out_dir, self.config.train_out_dir)
-        self.assertEqual(received.wandb, self.config.wandb)
         self.assertEqual(self.config.data_dir, self.version)
         self.assertEqual((received.data_dir / "coco/images/train/a.png").read_bytes(), self.image.read_bytes())
-        self.assertEqual(wandb.init.call_args.kwargs["dir"], str(self.config.out_dir))
 
-    def test_invalid_staged_paths_stop_before_logging_or_training(self):
+    def test_invalid_staged_paths_stop_before_training(self):
         wrong_version = self.scratch / "v002.other"
         wrong_version.mkdir()
         file_path = self.scratch / self.version.name
@@ -168,24 +165,24 @@ class DatasetStagingTests(unittest.TestCase):
         ]
         for staged, error in cases:
             with self.subTest(staged=staged):
-                wandb = MagicMock()
                 train = Mock()
                 with (
                     patch.dict(os.environ, {"BV_ML_DATA_DIR": str(staged)}),
-                    patch.dict(sys.modules, {"wandb": wandb}),
+                    patch.dict(sys.modules, {"wandb": None}),
                     self.assertRaises(error),
                 ):
                     base._execute(train, self.config)
-                wandb.init.assert_not_called()
                 train.assert_not_called()
 
     def test_archive_reuses_and_explicitly_rebuilds_completed_archives(self):
         original = self.archive.read_bytes()
         modified = self.archive.stat().st_mtime_ns
+        self.archive.chmod(0o600)
         with contextlib.redirect_stdout(io.StringIO()):
             prepare_datasets.archive_dataset(self.version)
         self.assertEqual(self.archive.read_bytes(), original)
         self.assertEqual(self.archive.stat().st_mtime_ns, modified)
+        self.assertEqual(self.archive.stat().st_mode & 0o044, 0o044)
         (self.version / "coco/extra.json").write_text("{}")
         with contextlib.redirect_stdout(io.StringIO()):
             prepare_datasets.archive_dataset(self.version, force=True)

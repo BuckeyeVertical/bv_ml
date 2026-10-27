@@ -3,11 +3,12 @@ import inspect
 import json
 import os
 import re
+import runpy
 import shlex
 import subprocess
 import sys
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -32,19 +33,6 @@ _Result = TypeVar("_Result")
 
 
 @dataclass(frozen=True)
-class WandbConfig:
-    """Framework-independent settings for the W&B run owned by the wrapper."""
-
-    entity: str
-    project: str
-    group: str
-    name: str
-    id: str
-    dir: str
-    mode: str = "online"
-
-
-@dataclass(frozen=True)
 class Run:
     """Paths, resources, and reserved metadata for one training invocation."""
 
@@ -62,18 +50,6 @@ class Run:
     def train_out_dir(self) -> Path:
         """Training output directory that frameworks can recreate safely."""
         return self.out_dir / "train"
-
-    @property
-    def wandb(self) -> WandbConfig:
-        """W&B settings available to training code before logging starts."""
-        return WandbConfig(
-            entity="BuckeyeVertical",
-            project=f"season-{self.season}",
-            group=self.model_path.as_posix(),
-            name=self.out_dir.name,
-            id=self.run_id,
-            dir=str(self.out_dir),
-        )
 
 
 def _reserve_run(
@@ -121,7 +97,7 @@ def _reserve_run(
             raise ValueError(f"Reserved run metadata does not match: {out_dir}")
         run_id = saved.get("run_id")
         if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{32}", run_id):
-            raise ValueError(f"Reserved run has an invalid W&B run ID: {out_dir}")
+            raise ValueError(f"Reserved run has an invalid run ID: {out_dir}")
     else:
         try:
             out_dir.mkdir(parents=True)
@@ -143,29 +119,20 @@ def _reserve_run(
     )
 
 
-def _execute(train: Callable[[Run], _Result], config: Run) -> _Result:
+def _execute(train: Callable[[Run], _Result], run: Run) -> _Result:
     staged_dir = os.environ.get("BV_ML_DATA_DIR")
     if staged_dir:
         data_dir = Path(staged_dir).resolve(strict=True)
-        if not data_dir.is_dir() or data_dir.name != config.data_dir.name:
-            raise ValueError(f"Staged dataset must be a directory named {config.data_dir.name}: {data_dir}")
-        config = replace(config, data_dir=data_dir)
+        if not data_dir.is_dir() or data_dir.name != run.data_dir.name:
+            raise ValueError(f"Staged dataset must be a directory named {run.data_dir.name}: {data_dir}")
+        run = replace(run, data_dir=data_dir)
 
-    import wandb
-
-    print(config)
-    with wandb.init(
-        **asdict(config.wandb),
-        config={
-            "model_path": config.model_path.as_posix(),
-            "model": config.model_path.name,
-            "run_id": config.run_id,
-            "run_timestamp": config.run_timestamp,
-            "data_version": config.data_version,
-            "season": config.season,
-        },
-    ):
-        return train(config)
+    adapter_path = Path(inspect.getfile(train)).resolve().with_name("__wandb__.py")
+    if adapter_path.is_file():
+        adapter = runpy.run_path(str(adapter_path))
+        with adapter["track"](run):
+            return train(run)
+    return train(run)
 
 
 def _submit(script_path: Path, run: Run) -> None:
@@ -277,13 +244,14 @@ def slurmable(
 
 
 def slurmable(function=None, /, *, DATA_VERSION: int = -1, **slurm):
-    """Decorate train(config); running its file submits, while --train executes it.
+    """Decorate train(run); running its file submits, while --train executes it.
 
     Accepts bare @slurmable or native Slurm options such as time="01:00:00".
     Underscores in option names become hyphens in the generated directives.
     DATA_VERSION selects the dataset (default: -1, the latest version).
     This reserved keyword is not passed to Slurm.
     Importing is idle; calling the decorated function runs training directly.
+    A sibling __wandb__.py can provide a track(run) context for logging.
     """
     def decorate(train):
         if (
@@ -299,7 +267,7 @@ def slurmable(function=None, /, *, DATA_VERSION: int = -1, **slurm):
             inspect.Parameter.POSITIONAL_ONLY,
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
         ):
-            raise TypeError("A @slurmable function must take exactly one config argument")
+            raise TypeError("A @slurmable function must take exactly one run argument")
 
         script_path = Path(inspect.getfile(train)).resolve()
         options = {**_DEFAULT_SLURM, **{key.replace("_", "-"): value for key, value in slurm.items()}}

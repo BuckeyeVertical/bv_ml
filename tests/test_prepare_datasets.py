@@ -103,6 +103,49 @@ class DatasetPreparationTests(unittest.TestCase):
         self.assertEqual(blocker.read_text(), "preserve this file")
         self.assertEqual(summary["renamed"], [{"from": "v1.same", "to": "v003.same"}])
 
+    def test_private_inputs_and_new_outputs_are_readable_without_granting_write_access(self):
+        previous_umask = os.umask(0o077)
+        try:
+            self.data.chmod(0o700)
+            version = self.make_dataset("v001.private")
+            image = version / "yolo/images/train/a.png"
+            image.chmod(0o400)
+            original = image.read_bytes()
+            self.make_dataset("raw", raw=True)
+            self.make_zip("upload.zip", wrapper="wrapped")
+            outside = self.root / "private"
+            outside.mkdir()
+            private_file = outside / "private.txt"
+            private_file.write_text("keep private")
+            (self.data / "external").symlink_to(outside, target_is_directory=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                summary = prepare_datasets.prepare_datasets(self.data)
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(summary["skipped"], [])
+        self.assertEqual(len(summary["prepared"]), 3)
+        self.assertEqual(image.read_bytes(), original)
+        self.assertFalse(image.stat().st_mode & stat.S_IWUSR)
+        self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(private_file.stat().st_mode), 0o600)
+        for path in (self.data, *self.data.rglob("*")):
+            if path.is_symlink():
+                continue
+            with self.subTest(path=path.relative_to(self.data)):
+                mode = stat.S_IMODE(path.stat().st_mode)
+                required = 0o055 if path.is_dir() else 0o044
+                self.assertEqual(mode & required, required)
+                self.assertEqual(mode & 0o022, 0)
+        for item in summary["prepared"]:
+            with tarfile.open(item["archive"]) as archive:
+                for member in archive.getmembers():
+                    if member.isdir() or member.isfile():
+                        with self.subTest(archive=item["archive"], member=member.name):
+                            required = 0o055 if member.isdir() else 0o044
+                            self.assertEqual(member.mode & required, required)
+                            self.assertEqual(member.mode & 0o022, 0)
+
     def test_failed_raw_wrap_restores_original_directory_and_continues(self):
         raw = self.make_dataset("raw", raw=True)
         good = self.make_dataset("v010.good")

@@ -36,6 +36,20 @@ _SUMMARY_FIELDS = {
 }
 
 
+def _make_readable(path: Path) -> None:
+    """Share files and directories without adding write access or following links."""
+    mode = path.lstat().st_mode
+    if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+        return
+    permissions = stat.S_IMODE(mode)
+    readable = permissions | (0o555 if stat.S_ISDIR(mode) else 0o444)
+    if readable != permissions:
+        path.chmod(readable)
+    if stat.S_ISDIR(mode):
+        for child in path.iterdir():
+            _make_readable(child)
+
+
 @dataclass
 class _Split:
     name: str
@@ -333,6 +347,7 @@ def convert_yolo_to_coco(version_dir: Path) -> Path:
         if destination.exists() or destination.is_symlink():
             manifest = _existing_manifest(destination, fingerprint, splits)
             _assert_unchanged(stamps, splits)
+            _make_readable(destination)
             _report(destination, manifest, unchanged=True)
             return destination
 
@@ -356,6 +371,7 @@ def convert_yolo_to_coco(version_dir: Path) -> Path:
                 (staging / "images" / split.name).symlink_to(target, target_is_directory=True)
             _write_json(staging / "manifest.json", manifest)
             _assert_unchanged(stamps, splits)
+            _make_readable(staging)
             staging.rename(destination)
         _report(destination, manifest)
         return destination
@@ -369,12 +385,15 @@ def archive_dataset(version_dir: Path, *, force: bool = False) -> Path:
     version_dir = version_dir.resolve(strict=True)
     if not version_dir.is_dir():
         raise ValueError(f"Not a dataset version directory: {version_dir}")
+    _make_readable(version_dir)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.parent.chmod(stat.S_IMODE(destination.parent.stat().st_mode) | 0o555)
     with destination.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if destination.exists() and not force:
             if not destination.is_file():
                 raise ValueError(f"Dataset archive is not a file: {destination}")
+            _make_readable(destination)
             print(f"Dataset archive already exists: {destination}")
             return destination
         print(f"Archiving dataset: {version_dir}", flush=True)
@@ -382,6 +401,7 @@ def archive_dataset(version_dir: Path, *, force: bool = False) -> Path:
             archive_path = Path(temporary) / "dataset.tar"
             with tarfile.open(archive_path, "w", dereference=False) as archive:
                 archive.add(version_dir, arcname=version_name)
+            _make_readable(archive_path)
             archive_path.replace(destination)
     print(f"Dataset archive ready: {destination}")
     return destination
@@ -574,6 +594,8 @@ def prepare_datasets(data_root: Path) -> dict:
                 continue
             summary["prepared"].append({"version": version_dir.name, "coco_dir": str(coco_dir), "archive": str(archive)})
             print(f"READY {version_dir.name}: {archive}", flush=True)
+
+        _make_readable(data_root)
 
     print(f"Preparation finished: {len(summary['prepared'])} prepared, {len(summary['skipped'])} skipped", flush=True)
     return summary

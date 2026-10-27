@@ -1,16 +1,18 @@
 import contextlib
 import io
 import json
+import os
 import runpy
 import shlex
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import base
 
@@ -43,7 +45,7 @@ class DataVersionTests(unittest.TestCase):
             "from base import slurmable\n"
             f"DATA_VERSION = {module_version}\n"
             f"{decorator}\n"
-            "def train(config):\n"
+            "def train(run):\n"
             "    raise AssertionError('Submission must not execute training')\n"
         )
 
@@ -99,7 +101,6 @@ class DataVersionTests(unittest.TestCase):
                 config = execute.call_args.args[1]
                 self.assertEqual(config.data_version, 2)
                 self.assertEqual(config.season, "2026-2027")
-                self.assertEqual(config.wandb.project, "season-2026-2027")
                 self.assertIn(str(config.out_dir / "logs" / "slurm-%j.out"), script)
                 newer.rmdir()
 
@@ -144,7 +145,7 @@ class DataVersionTests(unittest.TestCase):
         config = base._reserve_run(self.script, {}, -1)
         self.assertTrue(config.out_dir.name.endswith(".dv1000"))
 
-    def test_queued_job_reuses_reserved_folder_and_wandb_id(self):
+    def test_queued_job_reuses_reserved_folder_and_run_id(self):
         submitted = base._reserve_run(self.script, {}, 1)
         started = base._reserve_run(
             self.script, {}, 1,
@@ -152,7 +153,6 @@ class DataVersionTests(unittest.TestCase):
             season=submitted.season,
         )
         self.assertEqual(started, submitted)
-        self.assertEqual(started.wandb, submitted.wandb)
         self.clock.now.assert_called_once_with(timezone.utc)
 
     def test_same_second_collision_preserves_existing_run(self):
@@ -182,79 +182,153 @@ class DataVersionTests(unittest.TestCase):
                 base._reserve_run(self.script, {}, 1, season=season)
         config = base._reserve_run(self.script, {}, 1, season="2027-2028")
         self.assertEqual(config.season, "2027-2028")
-        self.assertEqual(config.wandb.project, "season-2027-2028")
         self.assertEqual(config.out_dir.parent, self.root / "out/2027-2028/example")
 
 
-class WandbTests(unittest.TestCase):
-    def test_run_context_logs_and_closes_on_success_and_failure_for_any_framework(self):
-        for model_path, fails in (("ultralytics/yolo26s", False), ("custom/example", True)):
-            with self.subTest(model_path=model_path):
-                self.check_run_context(model_path, fails)
+class FrameworkAdapterTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.script = self.root / "models/example.py"
+        self.script.parent.mkdir()
+        self.adapter = self.script.with_name("__wandb__.py")
+        self.run = base.Run(
+            data_dir=self.root / "data/v001", out_dir=self.root / "out",
+            model_cache_dir=self.root / "cache", slurm={}, model_path=Path("example"),
+            run_id="0123456789abcdef0123456789abcdef",
+            run_timestamp="20261020T142813000000Z", data_version=1,
+        )
+        self.run.out_dir.mkdir()
+        self.events = self.run.out_dir / "events.txt"
+        environment = patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
 
-    def check_run_context(self, model_path, fails):
-        import wandb
+    def model(self, *, fails=False):
+        self.script.write_text(
+            "from base import slurmable\n"
+            "@slurmable\n"
+            "def train(run):\n"
+            "    with (run.out_dir / 'events.txt').open('a') as output:\n"
+            "        output.write('train\\n')\n"
+            + ("    raise ValueError('training failed')\n" if fails else "    return run.data_dir\n")
+        )
+        return runpy.run_path(str(self.script))["train"]
 
-        self.addCleanup(wandb.teardown)
-        real_init = wandb.init
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            config = base.Run(
-                data_dir=root / "data",
-                out_dir=root,
-                model_cache_dir=root / "cache",
-                slurm={},
-                model_path=Path(model_path),
-                run_id="0123456789abcdef0123456789abcdef",
-                run_timestamp="20261020T182813123456Z",
-                data_version=1,
-            )
-            runs = []
+    def write_adapter(self):
+        self.adapter.write_text(
+            "from contextlib import contextmanager\n"
+            "def record(run, message):\n"
+            "    with (run.out_dir / 'events.txt').open('a') as output:\n"
+            "        output.write(message + '\\n')\n"
+            "@contextmanager\n"
+            "def track(run):\n"
+            "    record(run, 'start:' + str(run.data_dir))\n"
+            "    try:\n"
+            "        yield\n"
+            "    except BaseException:\n"
+            "        record(run, 'error')\n"
+            "        raise\n"
+            "    finally:\n"
+            "        record(run, 'end')\n"
+        )
 
-            def offline_init(**kwargs):
-                self.assertEqual(kwargs["mode"], "online")
-                self.assertEqual(kwargs["entity"], "BuckeyeVertical")
-                self.assertEqual(kwargs["project"], "season-2026-2027")
-                self.assertEqual(kwargs["id"], config.run_id)
-                self.assertEqual(kwargs["group"], model_path)
-                self.assertEqual(kwargs["name"], config.out_dir.name)
-                self.assertEqual(kwargs["dir"], str(config.out_dir))
-                self.assertEqual(config.wandb.dir, kwargs["dir"])
-                self.assertEqual(config.wandb.mode, kwargs["mode"])
-                kwargs["mode"] = "offline"
-                kwargs["settings"] = wandb.Settings(console="off", quiet=True, disable_git=True, finish_timeout=10)
-                return real_init(**kwargs)
+    def test_import_and_submission_do_not_load_the_adapter(self):
+        self.adapter.write_text("raise AssertionError('Adapter must only load during training')\n")
+        with (
+            patch.object(base, "_reserve_run", return_value=self.run) as reserve,
+            patch.object(base, "_submit") as submit,
+            patch.dict(sys.modules, {"wandb": None, "ultralytics": None, "lightly_train": None}),
+        ):
+            self.model()
+            reserve.assert_not_called()
+            submit.assert_not_called()
+            with patch.object(base.sys, "argv", [str(self.script)]):
+                runpy.run_path(str(self.script), run_name="__main__")
+        submit.assert_called_once_with(self.script, self.run)
+        self.assertFalse(self.events.exists())
 
-            def train(received):
-                self.assertIs(received, config)
-                run = wandb.run
-                runs.append(run)
-                self.assertEqual(received.wandb.entity, run.entity)
-                self.assertEqual(received.wandb.project, run.project)
-                self.assertEqual(received.wandb.group, run.group)
-                self.assertEqual(received.wandb.name, run.name)
-                self.assertEqual(received.wandb.id, run.id)
-                self.assertEqual(run.config["run_id"], config.run_id)
-                self.assertEqual(run.config["model_path"], model_path)
-                wandb.log({"loss": 1.25})
-                self.assertEqual(dict(run.summary)["loss"], 1.25)
-                if fails:
-                    raise ValueError("training failed")
-                return "training result"
+    def test_decorated_calls_enter_and_close_the_adapter_on_success_and_failure(self):
+        self.write_adapter()
+        for fails in (False, True):
+            with self.subTest(training_fails=fails):
+                self.events.unlink(missing_ok=True)
+                train = self.model(fails=fails)
+                with patch.object(base, "_reserve_run", return_value=self.run):
+                    if fails:
+                        with self.assertRaisesRegex(ValueError, "training failed"):
+                            train()
+                    else:
+                        self.assertEqual(train(), self.run.data_dir)
+                self.assertEqual(self.events.read_text().splitlines(), [
+                    f"start:{self.run.data_dir}", "train", *(["error"] if fails else []), "end",
+                ])
 
-            with (
-                patch("wandb.init", side_effect=offline_init),
-                contextlib.redirect_stdout(io.StringIO()),
-                contextlib.redirect_stderr(io.StringIO()),
-            ):
-                if fails:
-                    with self.assertRaisesRegex(ValueError, "training failed"):
-                        base._execute(train, config)
-                else:
-                    self.assertEqual(base._execute(train, config), "training result")
-            self.assertIsNone(wandb.run)
-            self.assertEqual(len(runs), 1)
-            self.assertTrue(runs[0]._is_finished)
+    def test_adapter_receives_the_staged_dataset_path(self):
+        self.write_adapter()
+        train = self.model()
+        staged = self.root / "scratch/v001"
+        staged.mkdir(parents=True)
+        with (
+            patch.object(base, "_reserve_run", return_value=self.run),
+            patch.dict(os.environ, {"BV_ML_DATA_DIR": str(staged)}),
+        ):
+            self.assertEqual(train(), staged)
+        self.assertEqual(self.events.read_text().splitlines(), [f"start:{staged}", "train", "end"])
+        self.assertEqual(self.run.data_dir, self.root / "data/v001")
+
+    def test_only_the_sibling_adapter_is_loaded(self):
+        (self.root / "__wandb__.py").write_text("raise AssertionError('Wrong adapter')\n")
+        train = self.model()
+        with patch.object(base, "_reserve_run", return_value=self.run), patch.dict(sys.modules, {"wandb": None}):
+            self.assertEqual(train(), self.run.data_dir)
+        self.assertEqual(self.events.read_text(), "train\n")
+
+    def test_broken_adapter_is_reported_before_training(self):
+        self.adapter.write_text("raise RuntimeError('tracking setup failed')\n")
+        train = self.model()
+        with patch.object(base, "_reserve_run", return_value=self.run), self.assertRaisesRegex(RuntimeError, "tracking setup failed"):
+            train()
+        self.assertFalse(self.events.exists())
+
+
+class ExecutionTests(unittest.TestCase):
+    def test_training_return_values_and_errors_pass_through_without_wandb(self):
+        run = object()
+        for fails in (False, True):
+            with self.subTest(training_fails=fails):
+                callback = Mock(side_effect=ValueError("training failed")) if fails else Mock(return_value="training result")
+
+                def train(received, callback=callback):
+                    return callback(received)
+
+                with (
+                    patch.dict(os.environ, {}, clear=True),
+                    patch.dict(sys.modules, {"wandb": None}),
+                ):
+                    if fails:
+                        with self.assertRaisesRegex(ValueError, "training failed"):
+                            base._execute(train, run)
+                    else:
+                        self.assertEqual(base._execute(train, run), "training result")
+                callback.assert_called_once_with(run)
+
+    def test_every_worker_executes_training_without_wrapper_tracking(self):
+        for key in ("RANK", "LOCAL_RANK", "SLURM_PROCID"):
+            with self.subTest(rank_variable=key):
+                run = object()
+                callback = Mock(return_value="worker result")
+
+                def train(received, callback=callback):
+                    return callback(received)
+
+                with (
+                    patch.dict(os.environ, {key: "1"}, clear=True),
+                    patch.dict(sys.modules, {"wandb": None}),
+                ):
+                    self.assertEqual(base._execute(train, run), "worker result")
+                callback.assert_called_once_with(run)
 
 
 if __name__ == "__main__":

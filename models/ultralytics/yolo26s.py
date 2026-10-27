@@ -1,19 +1,14 @@
-from base import slurmable
+from base import Run, slurmable
 
 
-@slurmable(
-    clusters="pitzer",
-    partition="gpu-exp",
-    gpus_per_node=2,
-    cpus_per_task=24,
-    time="01:00:00",
-)
-def train(config):
+@slurmable(gpus_per_node=2, cpus_per_task=24)
+def train(run: Run):
     from ultralytics import YOLO
 
-    YOLO(str(config.model_cache_dir / "yolo26s.pt")).train(
-        data=str(config.data_dir / "yolo" / "data.yaml"),
-        save_dir=config.train_out_dir,
+    YOLO(str(run.model_cache_dir / "yolo26s.pt")).train(
+        data=str(run.data_dir / "yolo" / "data.yaml"),
+        save_dir=run.train_out_dir,
+        device=list(range(run.slurm["gpus-per-node"])),
         epochs=100,
         imgsz=640,
         batch=4,
