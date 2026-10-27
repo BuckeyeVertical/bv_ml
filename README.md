@@ -60,6 +60,10 @@ Runs use `BuckeyeVertical/season-2026-2027`. To add another framework, place a
 `__wandb__.py` exposing a `track(run)` context manager beside its model scripts.
 Directories without an adapter run training directly.
 
+Both adapters read the entity from `run.wandb_entity`, which defaults to
+`BuckeyeVertical` in `base.Run`. LightlyTrain passes this value through a temporary
+`WANDB_ENTITY` setting and restores the previous environment after training.
+
 ## Convert the CPPE-5 Parquet dataset
 
 With `bv_ml` active, convert the local files in `data/v002/`:

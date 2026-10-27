@@ -45,6 +45,7 @@ class Run:
     run_timestamp: str
     data_version: int
     season: str = SEASON
+    wandb_entity: str = "BuckeyeVertical"
 
     @property
     def train_out_dir(self) -> Path:

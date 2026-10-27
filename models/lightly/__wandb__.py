@@ -25,7 +25,7 @@ def track(run: Run):
         return original_train(*args, logger_args=loggers, **kwargs)
 
     environment = {
-        "WANDB_ENTITY": os.environ.get("WANDB_ENTITY", "BuckeyeVertical"),
+        "WANDB_ENTITY": run.wandb_entity,
         "WANDB_RUN_GROUP": run.model_path.as_posix(),
     }
     previous = {key: os.environ.get(key) for key in environment}

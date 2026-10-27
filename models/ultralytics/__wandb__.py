@@ -21,7 +21,7 @@ def track(run: Run):
 
     def start_wandb(trainer):
         wandb.init(
-            entity="BuckeyeVertical",
+            entity=run.wandb_entity,
             project=f"season-{run.season}",
             group=run.model_path.as_posix(),
             name=run.out_dir.name,

@@ -166,6 +166,7 @@ class LightlyWandbTests(unittest.TestCase):
                     model_path=Path("lightly/ltdetrv2-s"),
                     run_id="0123456789abcdef0123456789abcdef",
                     run_timestamp="20261020T142813000000Z", data_version=2,
+                    wandb_entity="configured-team",
                 )
                 runs = []
                 metric_definitions = []
@@ -212,7 +213,10 @@ class LightlyWandbTests(unittest.TestCase):
                         raise ValueError("training failed")
 
                 with (
-                    patch.dict(os.environ, {"RANK": "0", "LOCAL_RANK": "0", "SLURM_PROCID": "0"}),
+                    patch.dict(os.environ, {
+                        "RANK": "0", "LOCAL_RANK": "0", "SLURM_PROCID": "0",
+                        "WANDB_ENTITY": "environment-team",
+                    }),
                     patch("wandb.init", side_effect=offline_init) as initialize,
                     patch.object(train_task, "_train_task_from_config", side_effect=log_without_training),
                     contextlib.redirect_stdout(io.StringIO()),
@@ -223,6 +227,7 @@ class LightlyWandbTests(unittest.TestCase):
                             base._execute(model["train"].__wrapped__, config)
                     else:
                         base._execute(model["train"].__wrapped__, config)
+                    self.assertEqual(os.environ["WANDB_ENTITY"], "environment-team")
                 initialize.assert_called_once()
                 self.assertIs(lightly_train.train_object_detection, original_train)
                 self.assertEqual(
@@ -230,7 +235,7 @@ class LightlyWandbTests(unittest.TestCase):
                 )
                 self.assertIsNone(wandb.run)
                 self.assertTrue(runs[0]._is_finished)
-                self.assertEqual(runs[0].entity, "BuckeyeVertical")
+                self.assertEqual(runs[0].entity, "configured-team")
                 self.assertEqual(runs[0].project, "season-2026-2027")
                 self.assertEqual(runs[0].group, "lightly/ltdetrv2-s")
                 self.assertEqual(runs[0]._exit_code, int(fails))
@@ -265,6 +270,7 @@ class YoloWandbTests(unittest.TestCase):
                     model_path=Path("ultralytics/yolo26s"),
                     run_id="0123456789abcdef0123456789abcdef",
                     run_timestamp="20261020T142813000000Z", data_version=1,
+                    wandb_entity="configured-team",
                 )
                 runs = []
                 original_callbacks = callbacks.get_default_callbacks()
@@ -308,6 +314,7 @@ class YoloWandbTests(unittest.TestCase):
 
                 with (
                     patch("ultralytics.YOLO") as yolo,
+                    patch.dict(os.environ, {"WANDB_ENTITY": "environment-team"}),
                     patch.object(settings, "update") as update,
                     patch.object(wb, "wb", wandb),
                     patch.object(callbacks, "add_integration_callbacks", side_effect=add_native_wandb),
@@ -334,7 +341,7 @@ class YoloWandbTests(unittest.TestCase):
                 self.assertEqual(initialize.call_count, int(primary))
                 if primary:
                     tracking, = runs
-                    self.assertEqual(tracking.entity, "BuckeyeVertical")
+                    self.assertEqual(tracking.entity, "configured-team")
                     self.assertEqual(tracking.project, "season-2026-2027")
                     self.assertEqual(tracking.group, "ultralytics/yolo26s")
                     self.assertEqual(tracking.name, run.out_dir.name)

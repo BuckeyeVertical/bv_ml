@@ -124,6 +124,7 @@ class DataVersionTests(unittest.TestCase):
         self.assertEqual(second.out_dir.name, "example.26-10-20-182814.dv001")
         self.assertEqual(first.out_dir.parent, self.root / "out/2026-2027/example")
         self.assertEqual(first.run_timestamp, "20261020T182813123456Z")
+        self.assertEqual(first.wandb_entity, "BuckeyeVertical")
         self.assertRegex(first.run_id, r"^[0-9a-f]{32}$")
         self.assertNotEqual(first.run_id, second.run_id)
         self.assertEqual(json.loads((first.out_dir / "run.json").read_text()), {
