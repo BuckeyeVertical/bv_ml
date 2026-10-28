@@ -46,6 +46,7 @@ class Run:
     data_version: int
     season: str = SEASON
     wandb_entity: str = "BuckeyeVertical"
+    data: str | dict[str, object] | None = None
 
     @property
     def train_out_dir(self) -> Path:
@@ -128,7 +129,13 @@ def _execute(train: Callable[[Run], _Result], run: Run) -> _Result:
             raise ValueError(f"Staged dataset must be a directory named {run.data_dir.name}: {data_dir}")
         run = replace(run, data_dir=data_dir)
 
-    adapter_path = Path(inspect.getfile(train)).resolve().with_name("__wandb__.py")
+    framework_dir = Path(inspect.getfile(train)).resolve().parent
+    data_adapter_path = framework_dir / "__data__.py"
+    if data_adapter_path.is_file():
+        adapter = runpy.run_path(str(data_adapter_path))
+        run = replace(run, data=adapter["load"](run))
+
+    adapter_path = framework_dir / "__wandb__.py"
     if adapter_path.is_file():
         adapter = runpy.run_path(str(adapter_path))
         with adapter["track"](run):
@@ -252,6 +259,7 @@ def slurmable(function=None, /, *, DATA_VERSION: int = -1, **slurm):
     DATA_VERSION selects the dataset (default: -1, the latest version).
     This reserved keyword is not passed to Slurm.
     Importing is idle; calling the decorated function runs training directly.
+    A sibling __data__.py can provide load(run) to populate run.data.
     A sibling __wandb__.py can provide a track(run) context for logging.
     """
     def decorate(train):

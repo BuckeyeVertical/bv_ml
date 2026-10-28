@@ -194,6 +194,7 @@ class FrameworkAdapterTests(unittest.TestCase):
         self.script = self.root / "models/example.py"
         self.script.parent.mkdir()
         self.adapter = self.script.with_name("__wandb__.py")
+        self.data_adapter = self.script.with_name("__data__.py")
         self.run = base.Run(
             data_dir=self.root / "data/v001", out_dir=self.root / "out",
             model_cache_dir=self.root / "cache", slurm={}, model_path=Path("example"),
@@ -206,14 +207,15 @@ class FrameworkAdapterTests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
 
-    def model(self, *, fails=False):
+    def model(self, *, fails=False, return_data=False):
+        result = "run.data" if return_data else "run.data_dir"
         self.script.write_text(
             "from base import slurmable\n"
             "@slurmable\n"
             "def train(run):\n"
             "    with (run.out_dir / 'events.txt').open('a') as output:\n"
             "        output.write('train\\n')\n"
-            + ("    raise ValueError('training failed')\n" if fails else "    return run.data_dir\n")
+            + ("    raise ValueError('training failed')\n" if fails else f"    return {result}\n")
         )
         return runpy.run_path(str(self.script))["train"]
 
@@ -226,6 +228,8 @@ class FrameworkAdapterTests(unittest.TestCase):
             "@contextmanager\n"
             "def track(run):\n"
             "    record(run, 'start:' + str(run.data_dir))\n"
+            "    if run.data is not None:\n"
+            "        record(run, 'data:' + str(run.data))\n"
             "    try:\n"
             "        yield\n"
             "    except BaseException:\n"
@@ -237,6 +241,7 @@ class FrameworkAdapterTests(unittest.TestCase):
 
     def test_import_and_submission_do_not_load_the_adapter(self):
         self.adapter.write_text("raise AssertionError('Adapter must only load during training')\n")
+        self.data_adapter.write_text("raise AssertionError('Data must only load during training')\n")
         with (
             patch.object(base, "_reserve_run", return_value=self.run) as reserve,
             patch.object(base, "_submit") as submit,
@@ -281,10 +286,56 @@ class FrameworkAdapterTests(unittest.TestCase):
 
     def test_only_the_sibling_adapter_is_loaded(self):
         (self.root / "__wandb__.py").write_text("raise AssertionError('Wrong adapter')\n")
+        (self.root / "__data__.py").write_text("raise AssertionError('Wrong data adapter')\n")
         train = self.model()
         with patch.object(base, "_reserve_run", return_value=self.run), patch.dict(sys.modules, {"wandb": None}):
             self.assertEqual(train(), self.run.data_dir)
         self.assertEqual(self.events.read_text(), "train\n")
+
+    def test_data_loads_after_staging_and_reaches_training_with_or_without_tracking(self):
+        self.data_adapter.write_text(
+            "def load(run):\n"
+            "    with (run.out_dir / 'events.txt').open('a') as output:\n"
+            "        output.write('load:' + str(run.data_dir) + '\\n')\n"
+            "    return {'path': str(run.data_dir / 'yolo')}\n"
+        )
+        train = self.model(return_data=True)
+        staged = self.root / "scratch/v001"
+        staged.mkdir(parents=True)
+        data = {"path": str(staged / "yolo")}
+        for tracking in (False, True):
+            with self.subTest(tracking=tracking):
+                self.events.unlink(missing_ok=True)
+                if tracking:
+                    self.write_adapter()
+                with (
+                    patch.object(base, "_reserve_run", return_value=self.run),
+                    patch.dict(os.environ, {"BV_ML_DATA_DIR": str(staged)}),
+                ):
+                    self.assertEqual(train(), data)
+                self.assertEqual(self.events.read_text().splitlines(), [
+                    f"load:{staged}",
+                    *([f"start:{staged}", f"data:{data}"] if tracking else []),
+                    "train", *(["end"] if tracking else []),
+                ])
+                self.assertEqual(self.run.data_dir, self.root / "data/v001")
+                self.assertIsNone(self.run.data)
+
+    def test_failed_data_setup_stops_before_tracking_and_training(self):
+        self.adapter.write_text("raise AssertionError('Tracking must not start')\n")
+        for source in (
+            "raise ValueError('data setup failed')\n",
+            "def load(run):\n    raise ValueError('data setup failed')\n",
+        ):
+            with self.subTest(source=source):
+                self.data_adapter.write_text(source)
+                train = self.model()
+                with (
+                    patch.object(base, "_reserve_run", return_value=self.run),
+                    self.assertRaisesRegex(ValueError, "data setup failed"),
+                ):
+                    train()
+                self.assertFalse(self.events.exists())
 
     def test_broken_adapter_is_reported_before_training(self):
         self.adapter.write_text("raise RuntimeError('tracking setup failed')\n")

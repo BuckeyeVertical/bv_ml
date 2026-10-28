@@ -26,9 +26,10 @@ class LightlyLaunchTests(unittest.TestCase):
             )
             script = root / "models/lightly/ltdetrv2-s.py"
             script.parent.mkdir(parents=True)
-            (script.parent / "__wandb__.py").write_text(
-                (base.ROOT / "models/lightly/__wandb__.py").read_text()
-            )
+            for adapter in ("__data__.py", "__wandb__.py"):
+                (script.parent / adapter).write_text(
+                    (base.ROOT / "models/lightly" / adapter).read_text()
+                )
             # Exercise the real model and Lightly's argument validation, then
             # replace training with a two-process CPU collective. No downloads,
             # GPU allocation, dataset scan, or online W&B connection is needed.

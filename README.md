@@ -79,9 +79,19 @@ Pitzer's `gpu-exp` partition under `PAS3560`. Default Slurm resources live in
 `base.py`; model decorators override them. Training settings live in each model.
 
 Model entry points use `train(run)`. The `run` object provides `data_dir` (the
-selected dataset, staged on the compute node), `train_out_dir`, `out_dir`,
+selected dataset, staged on the compute node), `data` (the framework's dataset
+configuration), `train_out_dir`, `out_dir`,
 `model_cache_dir`, and Slurm resources. Set `DATA_VERSION=1` in `@slurmable(...)`
 to pin a dataset; the default, `-1`, selects the latest version at submission.
+
+Each framework directory defines its data connection in `__data__.py` with a
+`load(run)` function. The launcher calls it after resolving the staged dataset
+path and before entering W&B tracking, then supplies its return value as
+`run.data`. Model scripts pass `data=run.data` to their framework. Ultralytics
+receives the YOLO YAML path; LightlyTrain receives a YOLO configuration mapping
+with the dataset root and class names resolved by its adapter. Importing a model
+or submitting a job does not load the data adapter. Directories without one
+keep `run.data=None` and can use `run.data_dir` directly.
 
 To train inside an existing allocation, append `--train` to the model command.
 
