@@ -18,6 +18,12 @@ dependencies:
       - wandb==0.30.0
       # LTDETRv2 object detection and its local DDP launcher.
       - lightly-train==0.17.0
+      # RF-DETR object detection with native Lightning training and W&B logging.
+      - "rfdetr[train]==1.11.2"
+      # Hugging Face object detection with the native Trainer and COCO metrics.
+      - transformers==5.20.2
+      - accelerate==1.15.0
+      - "torchmetrics[detection]==1.8.2"
       # Ultralytics requires this when launching multi-GPU workers.
       - cloudpickle==3.1.1
       # Dataset conversion and repository checks.

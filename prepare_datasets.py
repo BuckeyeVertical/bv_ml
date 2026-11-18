@@ -16,8 +16,10 @@ import tarfile
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from getpass import getpass
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory, mkdtemp
+from urllib.parse import urlsplit
 
 import yaml
 from PIL import Image
@@ -377,11 +379,11 @@ def convert_yolo_to_coco(version_dir: Path) -> Path:
         return destination
 
 
-def archive_dataset(version_dir: Path, *, force: bool = False) -> Path:
+def archive_dataset(version_dir: Path, *, force: bool = False, archive_dir: Path | None = None) -> Path:
     """Prepare an atomic, reusable tar archive while preserving dataset links."""
     version_dir = Path(version_dir).absolute()
     version_name = version_dir.name
-    destination = version_dir.parent / "archives" / f"{version_name}.tar"
+    destination = (archive_dir or version_dir.parent / "archives") / f"{version_name}.tar"
     version_dir = version_dir.resolve(strict=True)
     if not version_dir.is_dir():
         raise ValueError(f"Not a dataset version directory: {version_dir}")
@@ -436,7 +438,7 @@ def _wrap_yolo(source: Path, destination: Path) -> None:
         raise
 
 
-def _extract_zip(source: Path, destination: Path) -> Path:
+def _extract_zip(source: Path, destination: Path, *, allow_symlinks: bool = True) -> Path:
     """Extract one dataset, allowing only paths and links inside the staging root."""
     with zipfile.ZipFile(source) as archive:
         for member in archive.infolist():
@@ -453,6 +455,8 @@ def _extract_zip(source: Path, destination: Path) -> Path:
             if member.is_dir():
                 target.mkdir(exist_ok=True)
             elif stat.S_ISLNK(member.external_attr >> 16):
+                if not allow_symlinks:
+                    raise ValueError(f"Roboflow ZIP contains a symlink: {member.filename}")
                 link = archive.read(member).decode("utf-8")
                 if Path(link).is_absolute() or not (target.parent / link).resolve().is_relative_to(destination.resolve()):
                     raise ValueError(f"ZIP symlink escapes its dataset directory: {member.filename}")
@@ -601,7 +605,109 @@ def prepare_datasets(data_root: Path) -> dict:
     return summary
 
 
-def _submit(args: argparse.Namespace) -> None:
+def _roboflow_url(command: list[str]) -> str:
+    message = 'Expected a Roboflow command like curl -L "https://app.roboflow.com/ds/..."'
+    try:
+        if len(command) == 1:
+            lexer = shlex.shlex(command[0], posix=True, punctuation_chars=";>")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            command = list(lexer)
+        if command[0] != "curl":
+            raise ValueError
+        options = command[1:]
+        if options and options[0] in {"-L", "--location"}:
+            options = options[1:]
+        url, *suffix = options
+        if suffix:
+            output, filename, *tail = suffix
+            expected_tail = [";", "unzip", filename, ";", "rm", filename]
+            if output not in {">", "-o", "--output"} or (tail and tail != expected_tail):
+                raise ValueError
+        if any(char.isspace() or ord(char) < 32 or char in '\\"' for char in url):
+            raise ValueError
+        parsed = urlsplit(url)
+        hostname = parsed.hostname or ""
+        if parsed.scheme != "https" or not hostname.endswith(".roboflow.com") or parsed.username is not None:
+            raise ValueError
+        if not parsed.path.startswith("/ds/") or len(parsed.path) == len("/ds/"):
+            raise ValueError
+    except (IndexError, ValueError):
+        raise ValueError(message) from None
+    return url
+
+
+def _download_roboflow(url: str, destination: Path) -> None:
+    print("Downloading Roboflow ZIP", flush=True)
+    result = subprocess.run(
+        [
+            "curl", "--disable", "--fail", "--silent", "--location", "--globoff",
+            "--proto", "=https", "--proto-redir", "=https", "--output", str(destination), "--config", "-",
+        ],
+        input=f"url = {json.dumps(url, ensure_ascii=False)}\n", text=True, check=False,
+    )
+    if result.returncode:
+        raise ValueError(f"Roboflow download failed (curl exit {result.returncode}). Check the export link and try again.")
+    if not zipfile.is_zipfile(destination):
+        raise ValueError("Roboflow download did not return a ZIP file. Check the export link and try again.")
+
+
+def _normalize_roboflow_yaml(yolo: Path) -> None:
+    path = yolo / "data.yaml"
+    config = yaml.safe_load(path.read_bytes())
+    if not isinstance(config, dict):
+        raise TypeError(f"{path}: expected a YAML mapping")
+    changed = False
+    for split in ("train", "val", "test"):
+        value = config.get(split)
+        if not isinstance(value, str) or not value.startswith("../"):
+            continue
+        relative = value.removeprefix("../")
+        directory = (yolo / relative).resolve()
+        if directory.is_relative_to(yolo) and directory.is_dir():
+            config[split] = relative
+            changed = True
+    if changed:
+        path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+
+def prepare_roboflow(data_root: Path, source: Path) -> dict:
+    """Build a new version from one export and expose it once its tar exists."""
+    archive_dir = data_root / "archives"
+    with (data_root / ".prepare.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        names = [path.name for path in data_root.iterdir()]
+        names.extend(path.stem for path in archive_dir.glob("*.tar"))
+        latest = max((int(match[1]) for name in names if (match := _VERSION.fullmatch(name))), default=0)
+        destination = data_root / _version_name("roboflow", latest + 1)
+        with TemporaryDirectory(prefix=".prepare-roboflow-", dir=data_root) as temporary:
+            staging = Path(temporary)
+            extracted = staging / "contents"
+            extracted.mkdir()
+            root = _extract_zip(source, extracted, allow_symlinks=False)
+            version = staging / destination.name
+            version.mkdir()
+            yolo = version / "yolo"
+            (root / "yolo" if (root / "yolo").is_dir() else root).rename(yolo)
+            _normalize_roboflow_yaml(yolo)
+            convert_yolo_to_coco(version)
+            archive = archive_dataset(version, archive_dir=archive_dir)
+            try:
+                version.rename(destination)
+            except BaseException:
+                archive.unlink(missing_ok=True)
+                raise
+
+    print(f"READY {destination.name}: {archive}", flush=True)
+    return {
+        "data_root": str(data_root),
+        "prepared": [{"version": destination.name, "coco_dir": str(destination / "coco"), "archive": str(archive)}],
+        "skipped": [], "renamed": [], "wrapped": [],
+        "imported": [{"source": source.name, "version": destination.name}],
+    }
+
+
+def _submit(args: argparse.Namespace, download: Path | None = None) -> None:
     log_dir = ROOT / "out" / "dataset-preparation"
     log_dir.mkdir(parents=True, exist_ok=True)
     command = [
@@ -610,7 +716,15 @@ def _submit(args: argparse.Namespace) -> None:
     ]
     if args.report is not None:
         command.extend(["--report", str(args.report.resolve())])
-    script = "\n".join(["#!/bin/bash", "set -euo pipefail", shlex.join(command), ""])
+    if args.zip is not None:
+        command.extend(["--zip", str(args.zip)])
+    lines = ["#!/bin/bash", "set -euo pipefail"]
+    if download is not None:
+        lines.extend([
+            f"download_dir={shlex.quote(str(download))}",
+            'trap \'rm -f -- "$download_dir/roboflow.zip" && rmdir -- "$download_dir"\' EXIT',
+        ])
+    script = "\n".join([*lines, shlex.join(command), ""])
     result = subprocess.run(
         [
             "sbatch",
@@ -641,27 +755,53 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--account", default="PAS3560")
     parser.add_argument("--cluster", default="pitzer")
     parser.add_argument("--partition", default="cpu-exp")
-    parser.add_argument("--cpus", type=int, default=1)
-    parser.add_argument("--time", default="04:00:00")
+    parser.add_argument("--cpus", type=int, default=2)
+    parser.add_argument("--time", default="08:00:00")
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument("--zip", type=Path, help="Create a new version from an existing Roboflow ZIP")
+    sources.add_argument("--existing", action="store_true", help="Prepare the existing dataset tree (the default)")
+    sources.add_argument(
+        "-rf", "--roboflow", nargs=argparse.REMAINDER, metavar="CURL",
+        help="Download a Roboflow export and create a new version. Put this option last, or pass it alone to paste privately.",
+    )
     args = parser.parse_args(argv)
     if args.cpus < 1:
         parser.error("--cpus must be at least 1")
+    download = None
+    submitted = False
     try:
         args.data_root = args.data_root.resolve(strict=True)
         if not args.data_root.is_dir():
             raise ValueError(f"Not a dataset directory: {args.data_root}")
+        if args.roboflow is not None:
+            url = _roboflow_url(args.roboflow or [getpass("Paste Roboflow curl command: ")])
+            log_dir = ROOT / "out" / "dataset-preparation"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            download = Path(mkdtemp(prefix=".roboflow-", dir=log_dir))
+            args.zip = download / "roboflow.zip"
+            _download_roboflow(url, args.zip)
+        elif args.zip is not None:
+            args.zip = args.zip.resolve(strict=True)
+            if not args.zip.is_file():
+                raise ValueError(f"Not a ZIP file: {args.zip}")
         if not args.run:
-            _submit(args)
+            _submit(args, download)
+            submitted = True
             return 0
-        summary = prepare_datasets(args.data_root)
+        summary = prepare_roboflow(args.data_root, args.zip) if args.zip is not None else prepare_datasets(args.data_root)
         job_id = os.environ.get("SLURM_JOB_ID") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         report = args.report or ROOT / "out" / "dataset-preparation" / f"summary-{job_id}.json"
         report.parent.mkdir(parents=True, exist_ok=True)
         report.write_text(json.dumps(summary, indent=2) + "\n")
         print(f"Preparation summary: {report}", flush=True)
         return 0 if summary["prepared"] else 1
-    except (OSError, ValueError, RuntimeError) as error:
+    except EOFError:
+        parser.exit(1, "error: No Roboflow curl command provided\n")
+    except (OSError, TypeError, ValueError, RuntimeError, zipfile.BadZipFile, yaml.YAMLError) as error:
         parser.exit(1, f"error: {error}\n")
+    finally:
+        if download is not None and not submitted:
+            shutil.rmtree(download)
 
 
 if __name__ == "__main__":

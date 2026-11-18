@@ -1,0 +1,22 @@
+# MMDetection uses a separate environment to match MMCV's compiled operators.
+name: bv_ml_mmdetection
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip=26.2
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - --find-links https://download.openmmlab.com/mmcv/dist/cu121/torch2.1.0/index.html
+      - "--only-binary=:all:"
+      - torch==2.1.0+cu121
+      - torchvision==0.16.0+cu121
+      - numpy==1.26.4
+      - opencv-python==4.11.0.86
+      - mmcv==2.1.0
+      - mmengine==0.10.7
+      - mmdet==3.3.0
+      - wandb==0.30.0
+variables:
+  PYTHONPATH: "."

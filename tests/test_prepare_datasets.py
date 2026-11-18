@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -234,6 +235,89 @@ class DatasetPreparationTests(unittest.TestCase):
             status = prepare_datasets.main(["--run", "--report", str(report)])
         self.assertEqual(status, 1)
         self.assertEqual(json.loads(report.read_text())["skipped"][0]["stage"], "extract")
+
+    def test_roboflow_paste_submits_only_the_zip_and_creates_a_new_version(self):
+        old = self.make_dataset("v002.keep")
+        source = self.root / "export.zip"
+        config = "train: ../train/images\nval: ../valid/images\ntest: ../test/images\nnames: [person]\n"
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("data.yaml", config)
+            for split in ("train", "valid", "test"):
+                archive.write(old / "yolo/images/train/a.png", f"{split}/images/a.png")
+                archive.writestr(f"{split}/labels/a.txt", "0 0.5 0.5 0.5 0.5\n")
+        url = "https://app.roboflow.com/ds/export?key=sample-key"
+        command = f'curl -L "{url}" > roboflow.zip; unzip roboflow.zip; rm roboflow.zip'
+        report = self.root / "report.json"
+        submitted = []
+
+        def run(args, *, input, **kwargs):
+            if args[0] == "curl":
+                self.assertNotIn(url, args)
+                self.assertIn(url, input)
+                shutil.copyfile(source, args[args.index("--output") + 1])
+                return subprocess.CompletedProcess(args, 0)
+            self.assertEqual(args[0], "sbatch")
+            self.assertNotIn(url, input)
+            submitted.append(input)
+            return subprocess.CompletedProcess(args, 0, "Submitted batch job 123\n", "")
+
+        with patch.object(prepare_datasets.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prepare_datasets.main(["--report", str(report), "-rf", command]), 0)
+        job, = submitted
+        worker = shlex.split(job.splitlines()[-1])
+        downloaded = Path(worker[worker.index("--zip") + 1])
+        self.assertTrue(downloaded.is_file())
+        self.assertFalse((self.data / "v003.roboflow").exists())
+
+        # Execute the generated job with a local substitute for srun.
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        srun = binaries / "srun"
+        srun.write_text('#!/bin/sh\nshift\nexec "$@"\n')
+        srun.chmod(0o755)
+        result = subprocess.run(
+            ["bash"], input=job, env={**os.environ, "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}"},
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(downloaded.parent.exists())
+        ready = json.loads(report.read_text())["prepared"][0]
+        self.assertEqual(ready["version"], "v003.roboflow")
+        self.assertNotIn(url, report.read_text())
+        with tarfile.open(ready["archive"]) as archive:
+            self.assertEqual(archive.getmember("v003.roboflow/coco/images/val").linkname, "../../yolo/valid/images")
+            config = archive.extractfile("v003.roboflow/yolo/data.yaml").read().decode()
+            self.assertIn("val: valid/images", config)
+            labels = json.load(archive.extractfile("v003.roboflow/coco/annotations/instances_val.json"))
+            self.assertEqual(len(labels["annotations"]), 1)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prepare_datasets.main(["--run", "--zip", str(source), "--report", str(report)]), 0)
+        self.assertTrue(source.is_file())
+        self.assertTrue(old.is_dir())
+        self.assertTrue((self.data / "v003.roboflow").is_dir())
+        self.assertTrue((self.data / "archives/v004.roboflow.tar").is_file())
+
+    def test_roboflow_failures_do_not_publish_an_incomplete_version(self):
+        bad = self.make_zip("invalid-export.zip", raw=True)
+        with zipfile.ZipFile(bad, "w") as archive:
+            archive.writestr("data.yaml", "train: ../missing/images\nnames: [person]\n")
+        existing = self.make_dataset("v002.keep")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            prepare_datasets.main(["--run", "--zip", str(bad)])
+        self.assertEqual(error.exception.code, 1)
+        self.assertEqual(list(self.data.glob("v*")), [existing])
+        self.assertEqual(list(self.data.glob(".prepare-roboflow-*")), [])
+
+        result = subprocess.CompletedProcess(["curl"], 22)
+        with (
+            patch.object(prepare_datasets.subprocess, "run", return_value=result),
+            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as error,
+        ):
+            prepare_datasets.main(["-rf", "curl", "-L", "https://universe.roboflow.com/ds/export"])
+        self.assertEqual(error.exception.code, 1)
+        self.assertEqual(list((self.root / "out/dataset-preparation").iterdir()), [])
 
     def test_concurrent_preparation_does_not_assign_duplicate_names_or_import_zips_twice(self):
         self.make_dataset("folder", raw=True)
